@@ -9,6 +9,7 @@ after each iteration and it's included in prompts for context.
 - For PDF pipeline stories, keep low-level parsing and structural heuristics inside `src/lib.rs`, and generate compressed synthetic PDFs inside binary integration tests so the real CLI contract is exercised without relying on external PDF tooling.
 - For OCR stories, normalize TSV OCR output back into the shared `ExtractedLine` model and drive binary integration tests with synthetic image-only PDFs plus a fake `tesseract` script so default language selection and diagnostics stay deterministic without machine-specific OCR data.
 - For rich PDF elements, keep raw text fragments and XObject placements available until page-level rendering so table heuristics and caption attachment can consume those fragments before paragraph collapsing, and cover the behavior with synthetic PDFs that mix text, captions, and image XObjects in one binary test.
+- For strict-mode CLI stories, collect the full warning set in `src/lib.rs` and only translate severity at the boundary so default mode can emit warning lines while `--strict` reuses the same page- and element-scoped diagnostics as fatal errors.
 
 ---
 
@@ -61,4 +62,15 @@ after each iteration and it's included in prompts for context.
   - Gotchas encountered
     - Reusing the old generic XObject warning for missing image resources was necessary to keep the US-002 binary contract stable while still adding richer degraded-element diagnostics for unsupported image encodings.
     - Raw `DeviceGray` and `DeviceRGB` image streams need a real raster asset format for Typst references, so the converter now emits minimal PNG files instead of OCR-only PNM intermediates.
+---
+
+## [2026-03-13] - US-005
+- Implemented strict-mode escalation so conversion warnings are preserved as a full diagnostic set and emitted as fatal error lines under `--strict`, while default mode keeps best-effort output with warning lines.
+- Added binary integration coverage for a single rich-content failure case that succeeds in default mode, fails in strict mode, and proves both diagnostics remain visible in each mode.
+- Files changed: `src/lib.rs`, `tests/cli.rs`, `.ralph-tui/progress.md`
+- **Learnings:**
+  - Patterns discovered
+    - Treating strict mode as a severity translation step avoids duplicating conversion logic and keeps warning/error text aligned across CLI modes.
+  - Gotchas encountered
+    - Existing strict handling only surfaced the first warning, so the regression test had to use one synthetic PDF that produced multiple diagnostics to prove the CLI was preserving context instead of accidentally passing on a single-warning fixture.
 ---

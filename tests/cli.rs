@@ -1069,3 +1069,120 @@ fn degraded_rich_elements_are_recorded_when_images_cannot_be_extracted() {
     assert!(stderr.contains("warning: degraded rich element on page 1"));
     assert!(stderr.contains("image ImBad could not be extracted"));
 }
+
+#[test]
+fn default_mode_preserves_output_when_conversion_reports_multiple_diagnostics() {
+    let output_root = test_path("default-multi-diagnostic");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let page = RichPageSpec {
+        lines: &[TextLine {
+            font: "F1",
+            size: 12.0,
+            x: 72.0,
+            y: 720.0,
+            text: "Best-effort mode should keep readable text.",
+        }],
+        extra_commands: &[
+            "q",
+            "160 0 0 90 72 548 cm",
+            "/ImBad Do",
+            "Q",
+            "q",
+            "160 0 0 90 260 548 cm",
+            "/ImMissing Do",
+            "Q",
+        ],
+        xobjects: &["ImBad"],
+    };
+    let image = ImageObjectSpec {
+        name: "ImBad",
+        width: 2,
+        height: 2,
+        color_space: "DeviceCMYK",
+        bits_per_component: 8,
+        filter: ImageObjectFilter::Flate,
+        bytes: &[
+            0, 255, 255, 0, 255, 0, 255, 0, //
+            255, 255, 0, 0, 0, 0, 0, 255,
+        ],
+    };
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&[page], &[image]));
+
+    let output = binary()
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(output.status.success());
+    assert_eq!(
+        read_to_string(&output_dir.join("main.typ")),
+        "Best-effort mode should keep readable text.\n"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning: degraded rich element on page 1"));
+    assert!(stderr.contains("image ImBad could not be extracted"));
+    assert!(stderr.contains("warning: unsupported content on page 1: XObject invocation"));
+}
+
+#[test]
+fn strict_mode_fails_when_conversion_reports_multiple_diagnostics() {
+    let output_root = test_path("strict-multi-diagnostic");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let page = RichPageSpec {
+        lines: &[TextLine {
+            font: "F1",
+            size: 12.0,
+            x: 72.0,
+            y: 720.0,
+            text: "Strict mode should reject incomplete conversion.",
+        }],
+        extra_commands: &[
+            "q",
+            "160 0 0 90 72 548 cm",
+            "/ImBad Do",
+            "Q",
+            "q",
+            "160 0 0 90 260 548 cm",
+            "/ImMissing Do",
+            "Q",
+        ],
+        xobjects: &["ImBad"],
+    };
+    let image = ImageObjectSpec {
+        name: "ImBad",
+        width: 2,
+        height: 2,
+        color_space: "DeviceCMYK",
+        bits_per_component: 8,
+        filter: ImageObjectFilter::Flate,
+        bytes: &[
+            0, 255, 255, 0, 255, 0, 255, 0, //
+            255, 255, 0, 0, 0, 0, 0, 255,
+        ],
+    };
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&[page], &[image]));
+
+    let output = binary()
+        .arg("--strict")
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!output_dir.join("main.typ").exists());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("error: degraded rich element on page 1"));
+    assert!(stderr.contains("image ImBad could not be extracted"));
+    assert!(stderr.contains("error: unsupported content on page 1: XObject invocation"));
+}

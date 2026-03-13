@@ -132,10 +132,7 @@ pub fn run(options: &CliOptions) -> Result<ConversionSuccess, CliFailure> {
 
     let mut warnings = collect_output_warnings(&options.output_dir)?;
     if options.strict && !warnings.is_empty() {
-        return Err(CliFailure::fatal(format!(
-            "error: {}",
-            warnings[0].message()
-        )));
+        return Err(strict_failure_from_warnings(&warnings));
     }
 
     let document = convert_pdf(&options.input_pdf)?;
@@ -143,10 +140,7 @@ pub fn run(options: &CliOptions) -> Result<ConversionSuccess, CliFailure> {
     let warnings = dedupe_warnings(warnings);
 
     if options.strict && !warnings.is_empty() {
-        return Err(CliFailure::fatal(format!(
-            "error: {}",
-            warnings[0].message()
-        )));
+        return Err(strict_failure_from_warnings(&warnings));
     }
 
     fs::create_dir_all(&options.output_dir)
@@ -224,6 +218,20 @@ fn dedupe_warnings(warnings: Vec<Warning>) -> Vec<Warning> {
     }
 
     deduped
+}
+
+fn strict_failure_from_warnings(warnings: &[Warning]) -> CliFailure {
+    let mut message = String::new();
+
+    for (index, warning) in warnings.iter().enumerate() {
+        if index > 0 {
+            message.push('\n');
+        }
+        message.push_str("error: ");
+        message.push_str(warning.message());
+    }
+
+    CliFailure::fatal(message)
 }
 
 fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
