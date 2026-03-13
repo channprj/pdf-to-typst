@@ -10,6 +10,7 @@ after each iteration and it's included in prompts for context.
 - For OCR stories, normalize TSV OCR output back into the shared `ExtractedLine` model and drive binary integration tests with synthetic image-only PDFs plus a fake `tesseract` script so default language selection and diagnostics stay deterministic without machine-specific OCR data.
 - For rich PDF elements, keep raw text fragments and XObject placements available until page-level rendering so table heuristics and caption attachment can consume those fragments before paragraph collapsing, and cover the behavior with synthetic PDFs that mix text, captions, and image XObjects in one binary test.
 - For strict-mode CLI stories, collect the full warning set in `src/lib.rs` and only translate severity at the boundary so default mode can emit warning lines while `--strict` reuses the same page- and element-scoped diagnostics as fatal errors.
+- For sample-regression stories, keep a manifest of real `data/` fixtures in binary integration tests with sample- and stage-specific failures, and use fake OCR binaries plus emitted-Typst validation helpers so regressions stay attributable even when external Typst tooling is unavailable.
 
 ---
 
@@ -73,4 +74,18 @@ after each iteration and it's included in prompts for context.
     - Treating strict mode as a severity translation step avoids duplicating conversion logic and keeps warning/error text aligned across CLI modes.
   - Gotchas encountered
     - Existing strict handling only surfaced the first warning, so the regression test had to use one synthetic PDF that produced multiple diagnostics to prove the CLI was preserving context instead of accidentally passing on a single-warning fixture.
+---
+
+## [2026-03-13] - US-006
+- Added sample-driven binary regression coverage in `tests/cli.rs` for `data/sample-00.pdf`, `data/sample-01.pdf`, and `data/sample-02.pdf`, with sample metadata, stage-specific failures, fake OCR for the scanned fixture, and emitted-Typst validation over generated `main.typ` files and referenced assets.
+- Extended `src/lib.rs` so compact PDF dictionaries like `/Type/Catalog` and `/Subtype/Image` are parsed correctly, and so 1-bit `CCITTFaxDecode` scanned images can be wrapped as TIFF inputs for OCR without introducing external PDF tooling.
+- Verified the story with `cargo fmt --check` and `cargo test`.
+- Files changed: `src/lib.rs`, `tests/cli.rs`, `.ralph-tui/progress.md`
+- **Learnings:**
+  - Patterns discovered
+    - Real `data/` fixtures benefit from an explicit sample manifest in binary tests because it keeps coverage intentional and makes sample/stage failures readable when one fixture regresses.
+    - OCR support can be extended to new PDF image encodings by converting embedded streams into a format `tesseract` already understands, which keeps the shared OCR pipeline intact.
+  - Gotchas encountered
+    - Real PDFs may omit whitespace between dictionary keys and names, so string checks like `/Type /Catalog` are too brittle for fixture-backed regression coverage.
+    - The environment had no `typst` binary and no network access for Typst crates, so compileability coverage had to be enforced through validation of the converter's emitted Typst subset plus asset references inside tests.
 ---

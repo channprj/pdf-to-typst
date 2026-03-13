@@ -3,7 +3,7 @@
   "sessionId": "8ae44d96-2c44-4e76-89f0-13b16562fcd3",
   "status": "running",
   "startedAt": "2026-03-13T10:41:17.906Z",
-  "updatedAt": "2026-03-13T11:24:49.146Z",
+  "updatedAt": "2026-03-13T11:34:31.643Z",
   "currentIteration": 5,
   "maxIterations": 0,
   "tasksCompleted": 5,
@@ -106,8 +106,6 @@
   ],
   "skippedTaskIds": [],
   "cwd": "/Volumes/990EVO+/workspace/pdf-to-typst",
-  "activeTaskIds": [
-    "US-006"
-  ],
+  "activeTaskIds": [],
   "subagentPanelVisible": false
 }

@@ -441,9 +441,7 @@ impl ParsedPdf {
             .objects
             .iter()
             .find_map(|(object_id, object)| {
-                object
-                    .dictionary
-                    .contains("/Type /Catalog")
+                dictionary_has_name_value(&object.dictionary, "/Type", "Catalog")
                     .then_some(*object_id)
             })
             .ok_or_else(|| "catalog object not found".to_string())?;
@@ -459,7 +457,7 @@ impl ParsedPdf {
     fn collect_page_refs(&self, object_id: u32, page_refs: &mut Vec<u32>) -> Result<(), String> {
         let object = self.object(object_id)?;
 
-        if object.dictionary.contains("/Type /Pages") {
+        if dictionary_has_name_value(&object.dictionary, "/Type", "Pages") {
             let kids = extract_reference_list_value(&object.dictionary, "/Kids")
                 .ok_or_else(|| format!("page tree node {object_id} is missing /Kids"))?;
 
@@ -470,7 +468,7 @@ impl ParsedPdf {
             return Ok(());
         }
 
-        if object.dictionary.contains("/Type /Page") {
+        if dictionary_has_name_value(&object.dictionary, "/Type", "Page") {
             page_refs.push(object_id);
             return Ok(());
         }
@@ -495,7 +493,7 @@ impl ParsedPdf {
             return Ok(Some(stream.clone()));
         }
 
-        if !object.dictionary.contains("/FlateDecode") {
+        if !dictionary_has_name_value(&object.dictionary, "/Filter", "FlateDecode") {
             return Ok(None);
         }
 
@@ -536,7 +534,7 @@ impl ParsedPdf {
 
         for (name, image_ref) in refs {
             let object = self.object(image_ref)?;
-            if !object.dictionary.contains("/Subtype /Image") {
+            if !dictionary_has_name_value(&object.dictionary, "/Subtype", "Image") {
                 continue;
             }
 
@@ -584,7 +582,84 @@ impl ParsedPdf {
         let height = extract_usize_value(&object.dictionary, "/Height")
             .ok_or_else(|| format!("image object {object_id} is missing /Height"))?;
 
-        if object.dictionary.contains("/DecodeParms") || object.dictionary.contains("/Filter [") {
+        if dictionary_has_name_value(&object.dictionary, "/Filter", "CCITTFaxDecode") {
+            let bits = extract_usize_value(&object.dictionary, "/BitsPerComponent").unwrap_or(1);
+            if bits != 1 {
+                return Ok(PageImageResource {
+                    name,
+                    asset: None,
+                    asset_issue: Some(format!(
+                        "unsupported image bit depth {bits}; only 1-bit CCITT scans are supported for OCR"
+                    )),
+                    ocr_candidate: None,
+                });
+            }
+
+            let Some(color_space) = extract_name_value(&object.dictionary, "/ColorSpace") else {
+                return Ok(PageImageResource {
+                    name,
+                    asset: None,
+                    asset_issue: Some("image color space is missing".to_string()),
+                    ocr_candidate: None,
+                });
+            };
+
+            if color_space != "DeviceGray" {
+                return Ok(PageImageResource {
+                    name,
+                    asset: None,
+                    asset_issue: Some(format!(
+                        "unsupported image color space {color_space}; CCITT OCR only supports DeviceGray"
+                    )),
+                    ocr_candidate: None,
+                });
+            }
+
+            let Some(decode_params_value) =
+                extract_dictionary_or_reference_value(&object.dictionary, "/DecodeParms")
+            else {
+                return Ok(PageImageResource {
+                    name,
+                    asset: None,
+                    asset_issue: Some("CCITT image is missing decode parameters".to_string()),
+                    ocr_candidate: None,
+                });
+            };
+            let decode_params = self.resolve_dictionary_value(decode_params_value)?;
+            let compression = match extract_i32_value(decode_params, "/K").unwrap_or(0) {
+                value if value < 0 => 4u16,
+                _ => {
+                    return Ok(PageImageResource {
+                        name,
+                        asset: None,
+                        asset_issue: Some(
+                            "unsupported CCITT compression; only Group 4 images are supported for OCR"
+                                .to_string(),
+                        ),
+                        ocr_candidate: None,
+                    });
+                }
+            };
+            let black_is_1 = extract_bool_value(decode_params, "/BlackIs1").unwrap_or(false);
+
+            return Ok(PageImageResource {
+                name,
+                asset: None,
+                asset_issue: Some(
+                    "CCITT image can be OCRed but cannot be emitted as a Typst asset".to_string(),
+                ),
+                ocr_candidate: Some(OcrImageCandidate {
+                    width,
+                    height,
+                    extension: "tiff",
+                    bytes: encode_ccitt_tiff(width, height, compression, black_is_1, stream),
+                }),
+            });
+        }
+
+        if object.dictionary.contains("/DecodeParms")
+            || dictionary_value_starts_with(&object.dictionary, "/Filter", "[")
+        {
             return Ok(PageImageResource {
                 name,
                 asset: None,
@@ -593,7 +668,7 @@ impl ParsedPdf {
             });
         }
 
-        if object.dictionary.contains("/DCTDecode") {
+        if dictionary_has_name_value(&object.dictionary, "/Filter", "DCTDecode") {
             let bytes = stream.clone();
             return Ok(PageImageResource {
                 name,
@@ -612,7 +687,7 @@ impl ParsedPdf {
         }
 
         let decoded = if object.dictionary.contains("/Filter") {
-            if !object.dictionary.contains("/FlateDecode") {
+            if !dictionary_has_name_value(&object.dictionary, "/Filter", "FlateDecode") {
                 return Ok(PageImageResource {
                     name,
                     asset: None,
@@ -788,6 +863,49 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
+fn encode_ccitt_tiff(
+    width: usize,
+    height: usize,
+    compression: u16,
+    black_is_1: bool,
+    compressed_bytes: &[u8],
+) -> Vec<u8> {
+    const TYPE_SHORT: u16 = 3;
+    const TYPE_LONG: u16 = 4;
+
+    let entry_count = 9u16;
+    let ifd_offset = 8u32;
+    let strip_offset = ifd_offset + 2 + u32::from(entry_count) * 12 + 4;
+    let photometric = if black_is_1 { 1u16 } else { 0u16 };
+    let mut tiff = Vec::with_capacity(strip_offset as usize + compressed_bytes.len());
+
+    tiff.extend_from_slice(b"II");
+    tiff.extend_from_slice(&42u16.to_le_bytes());
+    tiff.extend_from_slice(&ifd_offset.to_le_bytes());
+    tiff.extend_from_slice(&entry_count.to_le_bytes());
+
+    write_tiff_ifd_entry(&mut tiff, 256, TYPE_LONG, 1, width as u32);
+    write_tiff_ifd_entry(&mut tiff, 257, TYPE_LONG, 1, height as u32);
+    write_tiff_ifd_entry(&mut tiff, 258, TYPE_SHORT, 1, 1);
+    write_tiff_ifd_entry(&mut tiff, 259, TYPE_SHORT, 1, u32::from(compression));
+    write_tiff_ifd_entry(&mut tiff, 262, TYPE_SHORT, 1, u32::from(photometric));
+    write_tiff_ifd_entry(&mut tiff, 266, TYPE_SHORT, 1, 1);
+    write_tiff_ifd_entry(&mut tiff, 273, TYPE_LONG, 1, strip_offset);
+    write_tiff_ifd_entry(&mut tiff, 278, TYPE_LONG, 1, height as u32);
+    write_tiff_ifd_entry(&mut tiff, 279, TYPE_LONG, 1, compressed_bytes.len() as u32);
+    tiff.extend_from_slice(&0u32.to_le_bytes());
+    tiff.extend_from_slice(compressed_bytes);
+
+    tiff
+}
+
+fn write_tiff_ifd_entry(tiff: &mut Vec<u8>, tag: u16, field_type: u16, count: u32, value: u32) {
+    tiff.extend_from_slice(&tag.to_le_bytes());
+    tiff.extend_from_slice(&field_type.to_le_bytes());
+    tiff.extend_from_slice(&count.to_le_bytes());
+    tiff.extend_from_slice(&value.to_le_bytes());
+}
+
 fn is_line_start(bytes: &[u8], index: usize) -> bool {
     index == 0 || bytes[index - 1] == b'\n' || bytes[index - 1] == b'\r'
 }
@@ -918,6 +1036,21 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn dictionary_has_name_value(dictionary: &str, key: &str, value: &str) -> bool {
+    dictionary
+        .split_once(key)
+        .map(|(_, remainder)| remainder.trim_start())
+        .and_then(|remainder| remainder.strip_prefix('/'))
+        .is_some_and(|remainder| remainder.starts_with(value))
+}
+
+fn dictionary_value_starts_with(dictionary: &str, key: &str, prefix: &str) -> bool {
+    dictionary
+        .split_once(key)
+        .map(|(_, remainder)| remainder.trim_start())
+        .is_some_and(|remainder| remainder.starts_with(prefix))
 }
 
 fn extract_reference_value(dictionary: &str, key: &str) -> Option<u32> {
@@ -1098,6 +1231,25 @@ fn extract_name_value<'a>(dictionary: &'a str, key: &str) -> Option<&'a str> {
         .find(|ch: char| ch.is_whitespace() || matches!(ch, '/' | '[' | ']' | '<' | '>'))
         .unwrap_or(stripped.len());
     Some(&stripped[..end])
+}
+
+fn extract_bool_value(dictionary: &str, key: &str) -> Option<bool> {
+    let remainder = dictionary.split_once(key)?.1.trim_start();
+    if remainder.starts_with("true") {
+        Some(true)
+    } else if remainder.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn extract_i32_value(dictionary: &str, key: &str) -> Option<i32> {
+    let remainder = dictionary.split_once(key)?.1.trim_start();
+    let end = remainder
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, '/' | '[' | ']' | '<' | '>'))
+        .unwrap_or(remainder.len());
+    remainder[..end].parse().ok()
 }
 
 fn extract_usize_value(dictionary: &str, key: &str) -> Option<usize> {
