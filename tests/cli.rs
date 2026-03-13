@@ -53,6 +53,351 @@ fn write_script(path: &Path, contents: &str) {
 }
 
 #[derive(Clone, Copy)]
+enum SamplePdfKind {
+    Digital,
+    ScannedMixedKoreanAndEnglish,
+}
+
+struct SampleRegressionCase<'a> {
+    name: &'a str,
+    input_pdf: &'a str,
+    kind: SamplePdfKind,
+}
+
+fn install_sample_ocr_stub(output_root: &Path) -> (PathBuf, PathBuf) {
+    let fake_tesseract = output_root.join("fake-tesseract.sh");
+    let invocation_log = output_root.join("sample-ocr.log");
+
+    write_script(
+        &fake_tesseract,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+if [ "${{1:-}}" = "--list-langs" ]; then
+  printf 'List of available languages in "/tmp/tessdata/" (2):\neng\nkor\n'
+  exit 0
+fi
+printf '%s\n' "$@" >> "{}"
+cat <<'EOF'
+level	page_num	block_num	par_num	line_num	word_num	left	top	width	height	conf	text
+1	1	0	0	0	0	0	0	1000	1400	-1	
+2	1	1	0	0	0	60	80	620	290	-1	
+3	1	1	1	0	0	60	80	620	290	-1	
+4	1	1	1	1	0	60	80	420	42	-1	
+5	1	1	1	1	1	60	80	150	42	96	회의록
+5	1	1	1	1	2	224	80	108	42	94	Meeting
+5	1	1	1	1	3	344	80	180	42	94	Notes
+4	1	1	1	2	0	60	136	520	18	-1	
+5	1	1	1	2	1	60	136	118	18	93	스캔된
+5	1	1	1	2	2	190	136	162	18	92	문서입니다.
+4	1	1	1	3	0	60	162	650	18	-1	
+5	1	1	1	3	1	60	162	86	18	92	English
+5	1	1	1	3	2	158	162	58	18	91	text
+5	1	1	1	3	3	228	162	66	18	91	joins
+5	1	1	1	3	4	306	162	54	18	90	same
+5	1	1	1	3	5	372	162	132	18	90	paragraph.
+EOF
+"#,
+            invocation_log.display()
+        ),
+    );
+
+    (fake_tesseract, invocation_log)
+}
+
+fn fail_sample(sample: &str, stage: &str, detail: impl AsRef<str>) -> ! {
+    panic!(
+        "sample {sample} regressed during {stage}: {}",
+        detail.as_ref()
+    );
+}
+
+fn validate_generated_typst(sample: &str, output_dir: &Path, typst: &str) {
+    let mut line_index = 0usize;
+    let mut lines = typst.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        line_index += 1;
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() || trimmed == "// No digital text could be extracted from the PDF." {
+            continue;
+        }
+
+        if let Some(fence) = parse_raw_fence(trimmed) {
+            let mut closed = false;
+            for next_line in lines.by_ref() {
+                line_index += 1;
+                if next_line.trim() == fence {
+                    closed = true;
+                    break;
+                }
+            }
+
+            if !closed {
+                fail_sample(
+                    sample,
+                    "typst validation",
+                    format!("unclosed raw fence starting at line {line_index}"),
+                );
+            }
+
+            continue;
+        }
+
+        if trimmed.starts_with("#figure(")
+            || trimmed.starts_with("#table(")
+            || trimmed.starts_with("#image(")
+        {
+            let mut block = String::from(line);
+            let mut balance = parenthesis_balance(trimmed);
+
+            while balance > 0 {
+                let Some(next_line) = lines.next() else {
+                    fail_sample(
+                        sample,
+                        "typst validation",
+                        format!("unterminated macro starting at line {line_index}"),
+                    );
+                };
+                line_index += 1;
+                block.push('\n');
+                block.push_str(next_line);
+                balance += parenthesis_balance(next_line.trim());
+            }
+
+            if balance < 0 {
+                fail_sample(
+                    sample,
+                    "typst validation",
+                    format!("unexpected closing parenthesis near line {line_index}"),
+                );
+            }
+
+            validate_typst_macro_block(sample, output_dir, &block);
+        }
+    }
+}
+
+fn parse_raw_fence(line: &str) -> Option<&str> {
+    let fence_len = line
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == b'`')
+        .count();
+    if fence_len >= 3 && line.len() == fence_len {
+        Some(line)
+    } else {
+        None
+    }
+}
+
+fn parenthesis_balance(line: &str) -> i32 {
+    let mut balance = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in line.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+
+            if ch == '\\' {
+                escape = true;
+                continue;
+            }
+
+            if ch == '"' {
+                in_string = false;
+            }
+
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '(' => balance += 1,
+            ')' => balance -= 1,
+            _ => {}
+        }
+    }
+
+    balance
+}
+
+fn validate_typst_macro_block(sample: &str, output_dir: &Path, block: &str) {
+    let mut bracket_balance = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in block.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+
+            if ch == '\\' {
+                escape = true;
+                continue;
+            }
+
+            if ch == '"' {
+                in_string = false;
+            }
+
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '[' => bracket_balance += 1,
+            ']' => bracket_balance -= 1,
+            _ => {}
+        }
+
+        if bracket_balance < 0 {
+            fail_sample(
+                sample,
+                "typst validation",
+                format!("unexpected closing bracket in macro block:\n{block}"),
+            );
+        }
+    }
+
+    if in_string {
+        fail_sample(
+            sample,
+            "typst validation",
+            format!("unterminated string literal in macro block:\n{block}"),
+        );
+    }
+
+    if bracket_balance != 0 {
+        fail_sample(
+            sample,
+            "typst validation",
+            format!("unbalanced content brackets in macro block:\n{block}"),
+        );
+    }
+
+    for relative_path in extract_image_paths(block) {
+        let asset_path = output_dir.join(relative_path);
+        if !asset_path.is_file() {
+            fail_sample(
+                sample,
+                "typst validation",
+                format!("missing referenced asset {}", asset_path.display()),
+            );
+        }
+    }
+}
+
+fn extract_image_paths(block: &str) -> Vec<&str> {
+    let mut paths = Vec::new();
+    let mut remainder = block;
+
+    while let Some((_, tail)) = remainder.split_once("image(\"") {
+        if let Some((path, next)) = tail.split_once("\")") {
+            paths.push(path);
+            remainder = next;
+        } else {
+            break;
+        }
+    }
+
+    paths
+}
+
+fn run_sample_regression(case: &SampleRegressionCase<'_>) {
+    let output_root = test_path(case.name);
+    let output_dir = output_root.join("out");
+    create_dir(&output_root);
+
+    let mut command = binary();
+    let ocr_log = match case.kind {
+        SamplePdfKind::Digital => None,
+        SamplePdfKind::ScannedMixedKoreanAndEnglish => {
+            let (fake_tesseract, invocation_log) = install_sample_ocr_stub(&output_root);
+            command.env("PDF_TO_TYPST_TESSERACT_BIN", fake_tesseract);
+            Some(invocation_log)
+        }
+    };
+
+    let output = command
+        .arg(case.input_pdf)
+        .arg(&output_dir)
+        .output()
+        .unwrap_or_else(|error| {
+            fail_sample(
+                case.name,
+                "process execution",
+                format!("failed to launch binary: {error}"),
+            )
+        });
+
+    if !output.status.success() {
+        fail_sample(
+            case.name,
+            "conversion",
+            format!(
+                "exit code {:?}\nstderr:\n{}\nstdout:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            ),
+        );
+    }
+
+    let main_typ_path = output_dir.join("main.typ");
+    if !main_typ_path.is_file() {
+        fail_sample(
+            case.name,
+            "conversion",
+            format!("expected {}", main_typ_path.display()),
+        );
+    }
+
+    let main_typ = read_to_string(&main_typ_path);
+    validate_generated_typst(case.name, &output_dir, &main_typ);
+
+    match case.kind {
+        SamplePdfKind::Digital => {}
+        SamplePdfKind::ScannedMixedKoreanAndEnglish => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !main_typ.contains("회의록 Meeting Notes")
+                || !main_typ.contains("English text joins same paragraph.")
+            {
+                fail_sample(
+                    case.name,
+                    "OCR normalization",
+                    format!("unexpected OCR-backed Typst output:\n{main_typ}"),
+                );
+            }
+            if !stderr.is_empty() {
+                fail_sample(
+                    case.name,
+                    "conversion",
+                    format!("expected clean stderr for scanned sample, got:\n{stderr}"),
+                );
+            }
+
+            let invocation_log = ocr_log.expect("scanned sample should capture OCR log");
+            let log = read_to_string(&invocation_log);
+            if !log.contains("kor+eng") {
+                fail_sample(
+                    case.name,
+                    "OCR invocation",
+                    format!("expected default kor+eng OCR profile, got:\n{log}"),
+                );
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct TextLine<'a> {
     font: &'a str,
     size: f32,
@@ -1185,4 +1530,29 @@ fn strict_mode_fails_when_conversion_reports_multiple_diagnostics() {
     assert!(stderr.contains("error: degraded rich element on page 1"));
     assert!(stderr.contains("image ImBad could not be extracted"));
     assert!(stderr.contains("error: unsupported content on page 1: XObject invocation"));
+}
+
+#[test]
+fn sample_pdfs_regress_to_valid_typst_outputs() {
+    let cases = [
+        SampleRegressionCase {
+            name: "sample-00",
+            input_pdf: "data/sample-00.pdf",
+            kind: SamplePdfKind::ScannedMixedKoreanAndEnglish,
+        },
+        SampleRegressionCase {
+            name: "sample-01",
+            input_pdf: "data/sample-01.pdf",
+            kind: SamplePdfKind::Digital,
+        },
+        SampleRegressionCase {
+            name: "sample-02",
+            input_pdf: "data/sample-02.pdf",
+            kind: SamplePdfKind::Digital,
+        },
+    ];
+
+    for case in &cases {
+        run_sample_regression(case);
+    }
 }
