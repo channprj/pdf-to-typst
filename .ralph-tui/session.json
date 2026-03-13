@@ -3,10 +3,10 @@
   "sessionId": "8ae44d96-2c44-4e76-89f0-13b16562fcd3",
   "status": "running",
   "startedAt": "2026-03-13T10:41:17.906Z",
-  "updatedAt": "2026-03-13T11:21:05.720Z",
-  "currentIteration": 3,
+  "updatedAt": "2026-03-13T11:24:47.813Z",
+  "currentIteration": 4,
   "maxIterations": 0,
-  "tasksCompleted": 3,
+  "tasksCompleted": 4,
   "isPaused": false,
   "agentPlugin": "codex",
   "trackerState": {
@@ -35,8 +35,8 @@
       {
         "id": "US-004",
         "title": "Convert tables, images, and captions",
-        "status": "open",
-        "completedInSession": false
+        "status": "completed",
+        "completedInSession": true
       },
       {
         "id": "US-005",
@@ -82,6 +82,16 @@
       "durationMs": 600388,
       "startedAt": "2026-03-13T10:58:49.474Z",
       "endedAt": "2026-03-13T11:08:49.862Z"
+    },
+    {
+      "iteration": 4,
+      "status": "completed",
+      "taskId": "US-004",
+      "taskTitle": "Convert tables, images, and captions",
+      "taskCompleted": true,
+      "durationMs": 734534,
+      "startedAt": "2026-03-13T11:08:51.178Z",
+      "endedAt": "2026-03-13T11:21:05.712Z"
     }
   ],
   "skippedTaskIds": [],
