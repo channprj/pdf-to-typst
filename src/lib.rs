@@ -1,0 +1,197 @@
+use std::ffi::OsString;
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const HELP_TEXT: &str = "\
+pdf-to-typst
+
+Convert a single PDF into a deterministic Typst output directory.
+
+Usage: pdf-to-typst <INPUT_PDF> <OUTPUT_DIR> [OPTIONS]
+
+Required arguments:
+  <INPUT_PDF>   Path to the source PDF file.
+  <OUTPUT_DIR>  Directory where main.typ and assets/ are written.
+
+Options:
+  --strict      Treat warnings as fatal errors.
+  -h, --help    Print this help text.
+";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CliOptions {
+    pub input_pdf: PathBuf,
+    pub output_dir: PathBuf,
+    pub strict: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Warning {
+    message: String,
+}
+
+impl Warning {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ConversionSuccess {
+    pub main_typ: PathBuf,
+    pub warnings: Vec<Warning>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CliFailure {
+    pub exit_code: i32,
+    pub message: String,
+    pub print_help: bool,
+}
+
+impl CliFailure {
+    fn usage(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 1,
+            message: message.into(),
+            print_help: true,
+        }
+    }
+
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 2,
+            message: message.into(),
+            print_help: false,
+        }
+    }
+}
+
+impl fmt::Display for CliFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+pub fn help_text() -> &'static str {
+    HELP_TEXT
+}
+
+pub fn parse_args<I>(args: I) -> Result<Option<CliOptions>, CliFailure>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut strict = false;
+    let mut positional = Vec::new();
+
+    for arg in args.into_iter().skip(1) {
+        match arg.to_string_lossy().as_ref() {
+            "-h" | "--help" => return Ok(None),
+            "--strict" => strict = true,
+            flag if flag.starts_with('-') => {
+                return Err(CliFailure::usage(format!("unknown option: {flag}")));
+            }
+            _ => positional.push(PathBuf::from(arg)),
+        }
+    }
+
+    match positional.as_slice() {
+        [input_pdf, output_dir] => Ok(Some(CliOptions {
+            input_pdf: input_pdf.clone(),
+            output_dir: output_dir.clone(),
+            strict,
+        })),
+        _ => Err(CliFailure::usage(
+            "expected required arguments: <INPUT_PDF> <OUTPUT_DIR>",
+        )),
+    }
+}
+
+pub fn run(options: &CliOptions) -> Result<ConversionSuccess, CliFailure> {
+    validate_input(&options.input_pdf)?;
+
+    let warnings = collect_output_warnings(&options.output_dir)?;
+    if options.strict && !warnings.is_empty() {
+        return Err(CliFailure::fatal(format!(
+            "error: {}",
+            warnings[0].message()
+        )));
+    }
+
+    fs::create_dir_all(&options.output_dir)
+        .map_err(|error| CliFailure::fatal(format_output_error(&options.output_dir, &error)))?;
+
+    let assets_dir = options.output_dir.join("assets");
+    fs::create_dir_all(&assets_dir)
+        .map_err(|error| CliFailure::fatal(format_output_error(&assets_dir, &error)))?;
+
+    let main_typ = options.output_dir.join("main.typ");
+    fs::write(&main_typ, render_main_typ(&options.input_pdf))
+        .map_err(|error| CliFailure::fatal(format_output_error(&main_typ, &error)))?;
+
+    Ok(ConversionSuccess { main_typ, warnings })
+}
+
+fn validate_input(input_pdf: &Path) -> Result<(), CliFailure> {
+    let metadata = fs::metadata(input_pdf).map_err(|_| {
+        CliFailure::fatal(format!(
+            "error: input PDF does not exist: {}",
+            input_pdf.display()
+        ))
+    })?;
+
+    if !metadata.is_file() {
+        return Err(CliFailure::fatal(format!(
+            "error: input PDF is not a file: {}",
+            input_pdf.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn collect_output_warnings(output_dir: &Path) -> Result<Vec<Warning>, CliFailure> {
+    if !output_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = fs::read_dir(output_dir).map_err(|error| {
+        CliFailure::fatal(format!(
+            "error: failed to inspect output directory {}: {error}",
+            output_dir.display()
+        ))
+    })?;
+
+    if entries.next().is_some() {
+        return Ok(vec![Warning::new(format!(
+            "output directory is not empty: {}",
+            output_dir.display()
+        ))]);
+    }
+
+    Ok(Vec::new())
+}
+
+fn format_output_error(path: &Path, error: &std::io::Error) -> String {
+    format!("error: failed to write {}: {error}", path.display())
+}
+
+fn render_main_typ(input_pdf: &Path) -> String {
+    let input_name = input_pdf
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("input.pdf");
+
+    format!(
+        "// Generated by pdf-to-typst.\n\
+= Converted PDF\n\n\
+Generated from {input_name}\n"
+    )
+}

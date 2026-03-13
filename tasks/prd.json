@@ -1,0 +1,120 @@
+{
+  "name": "PDF to Typst CLI MVP",
+  "branchName": "ralph/pdf-to-typst-cli-mvp",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Define CLI contract and output layout",
+      "description": "As a developer, I want to convert one PDF into a predictable output directory so that I can inspect and compile the generated Typst files.",
+      "acceptanceCriteria": [
+        "The CLI accepts an input PDF path and an output directory path.",
+        "On success, the output directory contains one main .typ file and any referenced asset files.",
+        "The help text documents required arguments and key options, including --strict.",
+        "Success, success with warnings, and fatal failure behaviors are documented and covered by tests.",
+        "cargo fmt --check passes",
+        "cargo test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "dependsOn": [],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-002",
+      "title": "Emit Typst from digital PDFs",
+      "description": "As a developer, I want text-based PDFs to be converted into valid Typst structure so that I can reuse existing digital documents without manual rewriting.",
+      "acceptanceCriteria": [
+        "Digital PDF text is extracted in reading order.",
+        "Detectable structure, including headings, paragraphs, lists, and code-like blocks, is mapped to valid Typst syntax.",
+        "Document order is preserved across multi-page inputs.",
+        "Unsupported structures are surfaced through diagnostics instead of being silently dropped.",
+        "cargo fmt --check passes",
+        "cargo test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "dependsOn": [
+        "US-001"
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Add OCR support for scanned Korean and English PDFs",
+      "description": "As a developer, I want scanned PDFs to go through OCR so that Korean and English mixed documents can also be converted into Typst.",
+      "acceptanceCriteria": [
+        "Image-based scanned PDFs can be processed through an OCR path.",
+        "The default OCR configuration targets mixed Korean and English documents.",
+        "OCR output flows into the same downstream Typst generation pipeline used for digital PDFs.",
+        "Unavailable OCR support or low-confidence OCR results produce diagnostics that explain the cause and impact.",
+        "cargo fmt --check passes",
+        "cargo test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "dependsOn": [
+        "US-002"
+      ]
+    },
+    {
+      "id": "US-004",
+      "title": "Convert tables, images, and captions",
+      "description": "As a developer, I want non-text elements preserved in Typst so that converted documents remain useful beyond plain text extraction.",
+      "acceptanceCriteria": [
+        "Detected images are extracted as reusable asset files and referenced from generated Typst.",
+        "Tables with sufficient structural confidence are emitted as Typst table elements.",
+        "Image and table captions are preserved when they can be detected.",
+        "When rich element conversion is incomplete or impossible, the degraded elements are recorded.",
+        "cargo fmt --check passes",
+        "cargo test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "dependsOn": [
+        "US-002"
+      ]
+    },
+    {
+      "id": "US-005",
+      "title": "Support strict and non-strict conversion modes",
+      "description": "As a developer, I want to choose between best-effort conversion and fail-fast validation so that I can use the CLI for both exploration and strict pipelines.",
+      "acceptanceCriteria": [
+        "The default mode continues conversion as far as possible and records warnings when unsupported elements are encountered.",
+        "The --strict mode treats unsupported or incomplete conversion as a failure instead of a warning.",
+        "Diagnostics include page-level or element-level context when available.",
+        "Tests verify the difference between default mode and --strict mode for the same failure case.",
+        "cargo fmt --check passes",
+        "cargo test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "dependsOn": [
+        "US-002",
+        "US-003",
+        "US-004"
+      ]
+    },
+    {
+      "id": "US-006",
+      "title": "Validate compileability and regression coverage",
+      "description": "As a developer, I want automated regression checks on sample PDFs so that converted Typst output stays compilable as the converter evolves.",
+      "acceptanceCriteria": [
+        "Sample PDFs under data/ can be exercised by automated tests.",
+        "cargo test verifies that generated .typ output for supported samples is actually compilable.",
+        "Regression coverage includes at least one digital PDF and one scanned mixed Korean and English PDF.",
+        "Test failures identify the affected sample and the conversion stage that regressed.",
+        "cargo fmt --check passes",
+        "cargo test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "dependsOn": [
+        "US-003",
+        "US-004",
+        "US-005"
+      ]
+    }
+  ],
+  "metadata": {
+    "updatedAt": "2026-03-13T10:45:44.688Z"
+  }
+}
