@@ -4,12 +4,14 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use flate2::Compression;
 use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
 
 const HELP_TEXT: &str = "\
 pdf-to-typst
@@ -154,6 +156,12 @@ pub fn run(options: &CliOptions) -> Result<ConversionSuccess, CliFailure> {
     fs::create_dir_all(&assets_dir)
         .map_err(|error| CliFailure::fatal(format_output_error(&assets_dir, &error)))?;
 
+    for asset in document.assets {
+        let asset_path = assets_dir.join(&asset.filename);
+        fs::write(&asset_path, asset.bytes)
+            .map_err(|error| CliFailure::fatal(format_output_error(&asset_path, &error)))?;
+    }
+
     let main_typ = options.output_dir.join("main.typ");
     fs::write(&main_typ, document.typst)
         .map_err(|error| CliFailure::fatal(format_output_error(&main_typ, &error)))?;
@@ -239,7 +247,8 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
     }
 
     let mut warnings = Vec::new();
-    let mut lines = Vec::new();
+    let mut blocks = Vec::new();
+    let mut assets = Vec::new();
     let mut ocr_engine = OcrEngine::from_env();
 
     for (page_index, page_ref) in page_refs.iter().enumerate() {
@@ -249,7 +258,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
                 "error: failed to parse PDF page {page_number}: {message}"
             ))
         })?;
-        let page_images = pdf.page_ocr_images(*page_ref).map_err(|message| {
+        let page_images = pdf.page_image_resources(*page_ref).map_err(|message| {
             CliFailure::fatal(format!(
                 "error: failed to parse PDF page {page_number}: {message}"
             ))
@@ -257,7 +266,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
 
         let mut page_lines = Vec::new();
         let mut page_warnings = Vec::new();
-        let mut page_had_xobject = false;
+        let mut page_xobjects = Vec::new();
         let mut ocr_attempted = false;
 
         for content_ref in content_refs {
@@ -266,7 +275,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
                     Ok(parsed) => {
                         page_lines.extend(parsed.lines);
                         page_warnings.extend(parsed.warnings);
-                        page_had_xobject |= parsed.invoked_xobjects > 0;
+                        page_xobjects.extend(parsed.xobject_invocations);
                     }
                     Err(message) => page_warnings.push(Warning::new(format!(
                         "unsupported content on page {page_number}: {message}"
@@ -281,7 +290,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
             }
         }
 
-        if page_lines.is_empty() && page_had_xobject && page_images.image_count > 0 {
+        if page_lines.is_empty() && !page_xobjects.is_empty() && page_images.image_count > 0 {
             ocr_attempted = true;
 
             if page_images.candidates.is_empty() {
@@ -293,33 +302,50 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
                 page_lines.extend(ocr_result.lines);
                 page_warnings.extend(ocr_result.warnings);
             }
-        } else if page_had_xobject {
-            page_warnings.push(Warning::new(format!(
-                "unsupported content on page {page_number}: XObject invocation"
-            )));
         }
 
-        if page_lines.is_empty() {
-            if !ocr_attempted {
+        assign_line_ids(&mut page_lines);
+        let page_block_count_before = blocks.len();
+
+        if ocr_attempted {
+            if page_lines.is_empty() {
                 page_warnings.push(Warning::new(format!(
                     "unsupported content on page {page_number}: no digital text extracted"
                 )));
+            } else {
+                blocks.extend(render_text_blocks(page_lines));
             }
+        } else {
+            let rendered = render_page(page_number, page_lines, page_xobjects, page_images);
+            blocks.extend(rendered.blocks);
+            page_warnings.extend(rendered.warnings);
+            assets.extend(rendered.assets);
         }
 
-        lines.extend(page_lines);
+        if blocks.len() == page_block_count_before && !ocr_attempted {
+            page_warnings.push(Warning::new(format!(
+                "unsupported content on page {page_number}: no digital text extracted"
+            )));
+        }
         warnings.extend(dedupe_warnings(page_warnings));
     }
 
     Ok(ConvertedDocument {
-        typst: render_typst(lines),
+        typst: render_document_blocks(blocks),
+        assets,
         warnings: dedupe_warnings(warnings),
     })
 }
 
 struct ConvertedDocument {
     typst: String,
+    assets: Vec<OutputAsset>,
     warnings: Vec<Warning>,
+}
+
+struct OutputAsset {
+    filename: String,
+    bytes: Vec<u8>,
 }
 
 struct ParsedPdf {
@@ -331,14 +357,28 @@ struct PdfObject {
     stream: Option<Vec<u8>>,
 }
 
-struct PageOcrImages {
+struct PageImageResources {
     image_count: usize,
+    resources: HashMap<String, PageImageResource>,
     candidates: Vec<OcrImageCandidate>,
 }
 
+struct PageImageResource {
+    name: String,
+    asset: Option<ImageAssetCandidate>,
+    asset_issue: Option<String>,
+    ocr_candidate: Option<OcrImageCandidate>,
+}
+
+#[derive(Clone)]
 struct OcrImageCandidate {
     width: usize,
     height: usize,
+    extension: &'static str,
+    bytes: Vec<u8>,
+}
+
+struct ImageAssetCandidate {
     extension: &'static str,
     bytes: Vec<u8>,
 }
@@ -460,30 +500,33 @@ impl ParsedPdf {
         Ok(Some(decoded))
     }
 
-    fn page_ocr_images(&self, object_id: u32) -> Result<PageOcrImages, String> {
+    fn page_image_resources(&self, object_id: u32) -> Result<PageImageResources, String> {
         let page = self.object(object_id)?;
         let Some(resources_value) =
             extract_dictionary_or_reference_value(&page.dictionary, "/Resources")
         else {
-            return Ok(PageOcrImages {
+            return Ok(PageImageResources {
                 image_count: 0,
+                resources: HashMap::new(),
                 candidates: Vec::new(),
             });
         };
         let resources = self.resolve_dictionary_value(resources_value)?;
         let Some(xobject_value) = extract_dictionary_or_reference_value(resources, "/XObject")
         else {
-            return Ok(PageOcrImages {
+            return Ok(PageImageResources {
                 image_count: 0,
+                resources: HashMap::new(),
                 candidates: Vec::new(),
             });
         };
         let xobjects = self.resolve_dictionary_value(xobject_value)?;
         let refs = parse_named_reference_map(xobjects);
         let mut image_count = 0usize;
+        let mut resources = HashMap::new();
         let mut candidates = Vec::new();
 
-        for image_ref in refs.into_values() {
+        for (name, image_ref) in refs {
             let object = self.object(image_ref)?;
             if !object.dictionary.contains("/Subtype /Image") {
                 continue;
@@ -491,13 +534,16 @@ impl ParsedPdf {
 
             image_count += 1;
 
-            if let Some(candidate) = self.ocr_image_candidate(image_ref)? {
-                candidates.push(candidate);
+            let resource = self.image_resource(name.clone(), image_ref)?;
+            if let Some(candidate) = resource.ocr_candidate.as_ref() {
+                candidates.push(candidate.clone());
             }
+            resources.insert(name, resource);
         }
 
-        Ok(PageOcrImages {
+        Ok(PageImageResources {
             image_count,
+            resources,
             candidates,
         })
     }
@@ -514,10 +560,15 @@ impl ParsedPdf {
         }
     }
 
-    fn ocr_image_candidate(&self, object_id: u32) -> Result<Option<OcrImageCandidate>, String> {
+    fn image_resource(&self, name: String, object_id: u32) -> Result<PageImageResource, String> {
         let object = self.object(object_id)?;
         let Some(stream) = &object.stream else {
-            return Ok(None);
+            return Ok(PageImageResource {
+                name,
+                asset: None,
+                asset_issue: Some("image stream is missing".to_string()),
+                ocr_candidate: None,
+            });
         };
 
         let width = extract_usize_value(&object.dictionary, "/Width")
@@ -526,21 +577,40 @@ impl ParsedPdf {
             .ok_or_else(|| format!("image object {object_id} is missing /Height"))?;
 
         if object.dictionary.contains("/DecodeParms") || object.dictionary.contains("/Filter [") {
-            return Ok(None);
+            return Ok(PageImageResource {
+                name,
+                asset: None,
+                asset_issue: Some("unsupported image decode parameters".to_string()),
+                ocr_candidate: None,
+            });
         }
 
         if object.dictionary.contains("/DCTDecode") {
-            return Ok(Some(OcrImageCandidate {
-                width,
-                height,
-                extension: "jpg",
-                bytes: stream.clone(),
-            }));
+            let bytes = stream.clone();
+            return Ok(PageImageResource {
+                name,
+                asset: Some(ImageAssetCandidate {
+                    extension: "jpg",
+                    bytes: bytes.clone(),
+                }),
+                asset_issue: None,
+                ocr_candidate: Some(OcrImageCandidate {
+                    width,
+                    height,
+                    extension: "jpg",
+                    bytes,
+                }),
+            });
         }
 
         let decoded = if object.dictionary.contains("/Filter") {
             if !object.dictionary.contains("/FlateDecode") {
-                return Ok(None);
+                return Ok(PageImageResource {
+                    name,
+                    asset: None,
+                    asset_issue: Some("unsupported image filter".to_string()),
+                    ocr_candidate: None,
+                });
             }
 
             decode_flate_bytes(stream, object_id)?
@@ -550,10 +620,41 @@ impl ParsedPdf {
 
         let bits = extract_usize_value(&object.dictionary, "/BitsPerComponent").unwrap_or(8);
         if bits != 8 {
-            return Ok(None);
+            return Ok(PageImageResource {
+                name,
+                asset: None,
+                asset_issue: Some(format!(
+                    "unsupported image bit depth {bits}; only 8-bit images are supported"
+                )),
+                ocr_candidate: None,
+            });
         }
 
-        build_pnm_candidate(&object.dictionary, width, height, decoded)
+        let Some(color_space) = extract_name_value(&object.dictionary, "/ColorSpace") else {
+            return Ok(PageImageResource {
+                name,
+                asset: None,
+                asset_issue: Some("image color space is missing".to_string()),
+                ocr_candidate: None,
+            });
+        };
+
+        let asset = build_image_asset_candidate(color_space, width, height, &decoded);
+        let ocr_candidate = build_pnm_candidate(color_space, width, height, decoded);
+        let asset_issue = if asset.is_none() {
+            Some(format!(
+                "unsupported image color space {color_space}; only DeviceGray and DeviceRGB are supported"
+            ))
+        } else {
+            None
+        };
+
+        Ok(PageImageResource {
+            name,
+            asset,
+            asset_issue,
+            ocr_candidate,
+        })
     }
 }
 
@@ -572,34 +673,111 @@ fn decode_flate_bytes(stream: &[u8], object_id: u32) -> Result<Vec<u8>, String> 
 }
 
 fn build_pnm_candidate(
-    dictionary: &str,
+    color_space: &str,
     width: usize,
     height: usize,
     decoded: Vec<u8>,
-) -> Result<Option<OcrImageCandidate>, String> {
-    let Some(color_space) = extract_name_value(dictionary, "/ColorSpace") else {
-        return Ok(None);
-    };
-
+) -> Option<OcrImageCandidate> {
     let (magic, expected_len, extension) = match color_space {
         "DeviceGray" => ("P5", width.saturating_mul(height), "pgm"),
         "DeviceRGB" => ("P6", width.saturating_mul(height).saturating_mul(3), "ppm"),
-        _ => return Ok(None),
+        _ => return None,
     };
 
     if decoded.len() != expected_len {
-        return Ok(None);
+        return None;
     }
 
     let mut bytes = format!("{magic}\n{width} {height}\n255\n").into_bytes();
     bytes.extend_from_slice(&decoded);
 
-    Ok(Some(OcrImageCandidate {
+    Some(OcrImageCandidate {
         width,
         height,
         extension,
         bytes,
-    }))
+    })
+}
+
+fn build_image_asset_candidate(
+    color_space: &str,
+    width: usize,
+    height: usize,
+    decoded: &[u8],
+) -> Option<ImageAssetCandidate> {
+    let color_type = match color_space {
+        "DeviceGray" => 0,
+        "DeviceRGB" => 2,
+        _ => return None,
+    };
+
+    let channels = if color_type == 0 { 1 } else { 3 };
+    let expected_len = width.saturating_mul(height).saturating_mul(channels);
+    if decoded.len() != expected_len {
+        return None;
+    }
+
+    Some(ImageAssetCandidate {
+        extension: "png",
+        bytes: encode_png(width, height, color_type, decoded),
+    })
+}
+
+fn encode_png(width: usize, height: usize, color_type: u8, pixels: &[u8]) -> Vec<u8> {
+    let channels = if color_type == 0 { 1usize } else { 3usize };
+    let row_len = width.saturating_mul(channels);
+    let mut filtered = Vec::with_capacity(height.saturating_mul(row_len + 1));
+
+    for row in pixels.chunks(row_len) {
+        filtered.push(0);
+        filtered.extend_from_slice(row);
+    }
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    let _ = encoder.write_all(&filtered);
+    let compressed = encoder.finish().unwrap_or_default();
+
+    let mut png = Vec::new();
+    png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&(width as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(height as u32).to_be_bytes());
+    ihdr.push(8);
+    ihdr.push(color_type);
+    ihdr.push(0);
+    ihdr.push(0);
+    ihdr.push(0);
+    write_png_chunk(&mut png, b"IHDR", &ihdr);
+    write_png_chunk(&mut png, b"IDAT", &compressed);
+    write_png_chunk(&mut png, b"IEND", &[]);
+
+    png
+}
+
+fn write_png_chunk(png: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
+    png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    png.extend_from_slice(chunk_type);
+    png.extend_from_slice(data);
+
+    let mut crc_input = Vec::with_capacity(chunk_type.len() + data.len());
+    crc_input.extend_from_slice(chunk_type);
+    crc_input.extend_from_slice(data);
+    png.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+
+    !crc
 }
 
 fn is_line_start(bytes: &[u8], index: usize) -> bool {
@@ -923,11 +1101,12 @@ fn extract_usize_value(dictionary: &str, key: &str) -> Option<usize> {
 struct ParsedContent {
     lines: Vec<ExtractedLine>,
     warnings: Vec<Warning>,
-    invoked_xobjects: usize,
+    xobject_invocations: Vec<XObjectInvocation>,
 }
 
 #[derive(Clone)]
 struct ExtractedLine {
+    id: usize,
     page_number: usize,
     x: f32,
     y: f32,
@@ -944,6 +1123,78 @@ struct TextState {
     leading: Option<f32>,
 }
 
+#[derive(Clone, Copy)]
+struct GraphicsState {
+    ctm: [f32; 6],
+}
+
+impl Default for GraphicsState {
+    fn default() -> Self {
+        Self {
+            ctm: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BoundingBox {
+    left: f32,
+    bottom: f32,
+    right: f32,
+    top: f32,
+}
+
+struct XObjectInvocation {
+    name: String,
+    bounds: BoundingBox,
+    sequence: usize,
+}
+
+fn concat_matrices(left: [f32; 6], right: [f32; 6]) -> [f32; 6] {
+    [
+        left[0] * right[0] + left[2] * right[1],
+        left[1] * right[0] + left[3] * right[1],
+        left[0] * right[2] + left[2] * right[3],
+        left[1] * right[2] + left[3] * right[3],
+        left[0] * right[4] + left[2] * right[5] + left[4],
+        left[1] * right[4] + left[3] * right[5] + left[5],
+    ]
+}
+
+fn transform_point(matrix: [f32; 6], x: f32, y: f32) -> (f32, f32) {
+    (
+        matrix[0] * x + matrix[2] * y + matrix[4],
+        matrix[1] * x + matrix[3] * y + matrix[5],
+    )
+}
+
+fn matrix_bounds(matrix: [f32; 6]) -> BoundingBox {
+    let corners = [
+        transform_point(matrix, 0.0, 0.0),
+        transform_point(matrix, 1.0, 0.0),
+        transform_point(matrix, 0.0, 1.0),
+        transform_point(matrix, 1.0, 1.0),
+    ];
+    let mut left = f32::INFINITY;
+    let mut bottom = f32::INFINITY;
+    let mut right = f32::NEG_INFINITY;
+    let mut top = f32::NEG_INFINITY;
+
+    for (x, y) in corners {
+        left = left.min(x);
+        bottom = bottom.min(y);
+        right = right.max(x);
+        top = top.max(y);
+    }
+
+    BoundingBox {
+        left,
+        bottom,
+        right,
+        top,
+    }
+}
+
 fn parse_content_stream(stream: &[u8], page_number: usize) -> Result<ParsedContent, String> {
     let mut lexer = ContentLexer::new(stream);
     let mut operands = Vec::new();
@@ -953,16 +1204,36 @@ fn parse_content_stream(stream: &[u8], page_number: usize) -> Result<ParsedConte
         font_size: 12.0,
         ..TextState::default()
     };
-    let mut sequence = 0usize;
-    let mut invoked_xobjects = 0usize;
+    let mut text_sequence = 0usize;
+    let mut xobject_sequence = 0usize;
+    let mut graphics_state = GraphicsState::default();
+    let mut graphics_stack = Vec::new();
+    let mut xobject_invocations = Vec::new();
 
     while let Some(token) = lexer.next_token()? {
         match token {
             ContentToken::Operand(operand) => operands.push(operand),
             ContentToken::Operator(operator) => {
                 match operator.as_str() {
+                    "q" => graphics_stack.push(graphics_state),
+                    "Q" => {
+                        if let Some(saved) = graphics_stack.pop() {
+                            graphics_state = saved;
+                        }
+                    }
+                    "cm" => {
+                        if let Some(values) = take_numbers(&operands, 6) {
+                            graphics_state.ctm = concat_matrices(
+                                graphics_state.ctm,
+                                [
+                                    values[0], values[1], values[2], values[3], values[4],
+                                    values[5],
+                                ],
+                            );
+                        }
+                    }
                     "Tf" => {
-                        if let [.., Operand::Name, Operand::Number(size)] = operands.as_slice() {
+                        if let [.., Operand::Name(_), Operand::Number(size)] = operands.as_slice() {
                             state.font_size = size.abs();
                         }
                     }
@@ -1000,10 +1271,10 @@ fn parse_content_stream(stream: &[u8], page_number: usize) -> Result<ParsedConte
                                 &mut lines,
                                 page_number,
                                 &state,
-                                sequence,
+                                text_sequence,
                                 normalize_extracted_text(text),
                             );
-                            sequence += 1;
+                            text_sequence += 1;
                         }
                     }
                     "TJ" => {
@@ -1012,10 +1283,10 @@ fn parse_content_stream(stream: &[u8], page_number: usize) -> Result<ParsedConte
                                 &mut lines,
                                 page_number,
                                 &state,
-                                sequence,
+                                text_sequence,
                                 normalize_extracted_text(&text),
                             );
-                            sequence += 1;
+                            text_sequence += 1;
                         }
                     }
                     "'" => {
@@ -1027,10 +1298,10 @@ fn parse_content_stream(stream: &[u8], page_number: usize) -> Result<ParsedConte
                                 &mut lines,
                                 page_number,
                                 &state,
-                                sequence,
+                                text_sequence,
                                 normalize_extracted_text(text),
                             );
-                            sequence += 1;
+                            text_sequence += 1;
                         }
                     }
                     "\"" => {
@@ -1042,14 +1313,21 @@ fn parse_content_stream(stream: &[u8], page_number: usize) -> Result<ParsedConte
                                 &mut lines,
                                 page_number,
                                 &state,
-                                sequence,
+                                text_sequence,
                                 normalize_extracted_text(text),
                             );
-                            sequence += 1;
+                            text_sequence += 1;
                         }
                     }
                     "Do" => {
-                        invoked_xobjects += 1;
+                        if let Some(Operand::Name(name)) = operands.last() {
+                            xobject_invocations.push(XObjectInvocation {
+                                name: name.clone(),
+                                bounds: matrix_bounds(graphics_state.ctm),
+                                sequence: xobject_sequence,
+                            });
+                            xobject_sequence += 1;
+                        }
                     }
                     "BI" | "ID" | "EI" => {
                         warnings.insert(format!(
@@ -1073,7 +1351,7 @@ fn parse_content_stream(stream: &[u8], page_number: usize) -> Result<ParsedConte
     Ok(ParsedContent {
         lines,
         warnings: warnings.into_iter().map(Warning::new).collect(),
-        invoked_xobjects,
+        xobject_invocations,
     })
 }
 
@@ -1432,6 +1710,7 @@ fn parse_ocr_tsv(tsv: &str, page_number: usize) -> Result<ParsedOcrPage, String>
                 .words
                 .sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
             ExtractedLine {
+                id: 0,
                 page_number,
                 x: group.left,
                 y: page_height - group.top,
@@ -1535,6 +1814,7 @@ fn push_text_line(
     }
 
     lines.push(ExtractedLine {
+        id: 0,
         page_number,
         x: state.x,
         y: state.y,
@@ -1551,7 +1831,7 @@ enum ContentToken {
 
 enum Operand {
     Number(f32),
-    Name,
+    Name(String),
     Str(String),
     Array(Vec<Operand>),
     Other,
@@ -1617,10 +1897,7 @@ impl<'a> ContentLexer<'a> {
             Some(b'<') if self.bytes.get(self.cursor + 1) != Some(&b'<') => {
                 self.read_hex_string().map(Operand::Str)
             }
-            Some(b'/') => {
-                let _ = self.read_name();
-                Ok(Operand::Name)
-            }
+            Some(b'/') => Ok(Operand::Name(self.read_name())),
             Some(b'+' | b'-' | b'.' | b'0'..=b'9') => self.read_number().map(Operand::Number),
             Some(_) => {
                 let _ = self.read_word();
@@ -1866,10 +2143,453 @@ fn normalize_extracted_text(text: &str) -> String {
     normalized
 }
 
-fn render_typst(lines: Vec<ExtractedLine>) -> String {
+struct RenderedPage {
+    blocks: Vec<String>,
+    warnings: Vec<Warning>,
+    assets: Vec<OutputAsset>,
+}
+
+struct PageRichElement {
+    sort_y: f32,
+    sort_x: f32,
+    block: String,
+}
+
+#[derive(Clone)]
+struct TableRowGroup {
+    y: f32,
+    font_size: f32,
+    cells: Vec<ExtractedLine>,
+}
+
+struct CaptionCandidate {
+    id: usize,
+    text: String,
+    y: f32,
+}
+
+enum CaptionKind {
+    Image,
+    Table,
+}
+
+enum PageEvent {
+    Text(ExtractedLine),
+    Rich(PageRichElement),
+}
+
+fn assign_line_ids(lines: &mut [ExtractedLine]) {
+    for (index, line) in lines.iter_mut().enumerate() {
+        line.id = index;
+    }
+}
+
+fn render_page(
+    page_number: usize,
+    lines: Vec<ExtractedLine>,
+    mut xobjects: Vec<XObjectInvocation>,
+    image_resources: PageImageResources,
+) -> RenderedPage {
+    let (mut rich_elements, mut consumed_ids) = detect_tables(&lines);
+    let mut warnings = Vec::new();
+    let mut assets = Vec::new();
+    let mut image_count = 0usize;
+
+    xobjects.sort_by(|left, right| {
+        right
+            .bounds
+            .top
+            .partial_cmp(&left.bounds.top)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                left.bounds
+                    .left
+                    .partial_cmp(&right.bounds.left)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| left.sequence.cmp(&right.sequence))
+    });
+
+    for invocation in xobjects {
+        let Some(resource) = image_resources.resources.get(&invocation.name) else {
+            warnings.push(Warning::new(format!(
+                "unsupported content on page {page_number}: XObject invocation"
+            )));
+            continue;
+        };
+
+        let Some(asset) = resource.asset.as_ref() else {
+            let detail = resource
+                .asset_issue
+                .as_deref()
+                .unwrap_or("unsupported image encoding");
+            warnings.push(Warning::new(format!(
+                "degraded rich element on page {page_number}: image {} could not be extracted ({detail})",
+                resource.name
+            )));
+            continue;
+        };
+
+        image_count += 1;
+        let filename = format!("page-{page_number}-image-{image_count}.{}", asset.extension);
+        let caption = find_caption_line(
+            lines.as_slice(),
+            &consumed_ids,
+            invocation.bounds,
+            CaptionKind::Image,
+        );
+        if let Some(caption) = &caption {
+            consumed_ids.insert(caption.id);
+        }
+
+        assets.push(OutputAsset {
+            filename: filename.clone(),
+            bytes: asset.bytes.clone(),
+        });
+        rich_elements.push(PageRichElement {
+            sort_y: caption.as_ref().map_or(invocation.bounds.top, |caption| {
+                caption.y.max(invocation.bounds.top)
+            }),
+            sort_x: invocation.bounds.left,
+            block: render_image_block(
+                &filename,
+                caption.as_ref().map(|caption| caption.text.as_str()),
+            ),
+        });
+    }
+
+    let mut events = lines
+        .into_iter()
+        .filter(|line| !consumed_ids.contains(&line.id))
+        .map(PageEvent::Text)
+        .collect::<Vec<_>>();
+    events.extend(rich_elements.into_iter().map(PageEvent::Rich));
+    events.sort_by(|left, right| page_event_sort_key(left, right));
+
+    let mut blocks = Vec::new();
+    let mut text_chunk = Vec::new();
+
+    for event in events {
+        match event {
+            PageEvent::Text(line) => text_chunk.push(line),
+            PageEvent::Rich(element) => {
+                blocks.extend(render_text_blocks(std::mem::take(&mut text_chunk)));
+                blocks.push(element.block);
+            }
+        }
+    }
+
+    blocks.extend(render_text_blocks(text_chunk));
+
+    RenderedPage {
+        blocks,
+        warnings,
+        assets,
+    }
+}
+
+fn page_event_sort_key(left: &PageEvent, right: &PageEvent) -> Ordering {
+    let (left_y, left_x, left_kind) = match left {
+        PageEvent::Text(line) => (line.y, line.x, 0usize),
+        PageEvent::Rich(element) => (element.sort_y, element.sort_x, 1usize),
+    };
+    let (right_y, right_x, right_kind) = match right {
+        PageEvent::Text(line) => (line.y, line.x, 0usize),
+        PageEvent::Rich(element) => (element.sort_y, element.sort_x, 1usize),
+    };
+
+    right_y
+        .partial_cmp(&left_y)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| left_x.partial_cmp(&right_x).unwrap_or(Ordering::Equal))
+        .then_with(|| left_kind.cmp(&right_kind))
+}
+
+fn detect_tables(lines: &[ExtractedLine]) -> (Vec<PageRichElement>, HashSet<usize>) {
+    if lines.is_empty() {
+        return (Vec::new(), HashSet::new());
+    }
+
+    let rows = group_table_rows(lines);
+    let body_font_size = infer_body_font_size(lines);
+    let mut rich_elements = Vec::new();
+    let mut consumed_ids = HashSet::new();
+    let mut row_index = 0usize;
+
+    while let Some(row) = rows.get(row_index) {
+        if row.cells.len() < 2 || !row_has_distinct_columns(row, body_font_size) {
+            row_index += 1;
+            continue;
+        }
+
+        let column_positions = row.cells.iter().map(|cell| cell.x).collect::<Vec<_>>();
+        let mut matched_rows = vec![row.clone()];
+        let mut previous_y = row.y;
+        let mut next_index = row_index + 1;
+
+        while let Some(next_row) = rows.get(next_index) {
+            let gap = previous_y - next_row.y;
+            if gap > body_font_size * 2.0 + 14.0 {
+                break;
+            }
+
+            if next_row.cells.len() != column_positions.len()
+                || !columns_align(&column_positions, next_row, body_font_size)
+            {
+                break;
+            }
+
+            matched_rows.push(next_row.clone());
+            previous_y = next_row.y;
+            next_index += 1;
+        }
+
+        if matched_rows.len() < 2 {
+            row_index += 1;
+            continue;
+        }
+
+        let bounds = table_bounds(&matched_rows, body_font_size);
+        let mut blocked = consumed_ids.clone();
+        for row in &matched_rows {
+            for cell in &row.cells {
+                blocked.insert(cell.id);
+            }
+        }
+
+        let caption = find_caption_line(lines, &blocked, bounds, CaptionKind::Table);
+        let mut table_consumed = blocked
+            .difference(&consumed_ids)
+            .copied()
+            .collect::<HashSet<_>>();
+        if let Some(caption) = &caption {
+            table_consumed.insert(caption.id);
+        }
+
+        rich_elements.push(PageRichElement {
+            sort_y: caption
+                .as_ref()
+                .map_or(bounds.top, |caption| caption.y.max(bounds.top)),
+            sort_x: bounds.left,
+            block: render_table_block(
+                &matched_rows
+                    .iter()
+                    .map(|row| {
+                        row.cells
+                            .iter()
+                            .map(|cell| normalize_plain_line(&cell.text))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+                caption.as_ref().map(|caption| caption.text.as_str()),
+            ),
+        });
+        consumed_ids.extend(table_consumed);
+        row_index = next_index;
+    }
+
+    (rich_elements, consumed_ids)
+}
+
+fn group_table_rows(lines: &[ExtractedLine]) -> Vec<TableRowGroup> {
+    let mut sorted = lines.to_vec();
+    sorted.sort_by(|left, right| {
+        right
+            .y
+            .partial_cmp(&left.y)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.x.partial_cmp(&right.x).unwrap_or(Ordering::Equal))
+            .then_with(|| left.sequence.cmp(&right.sequence))
+    });
+
+    let mut rows: Vec<TableRowGroup> = Vec::new();
+
+    for line in sorted {
+        let plain = normalize_plain_line(&line.text);
+        if plain.is_empty() {
+            continue;
+        }
+
+        if let Some(previous) = rows.last_mut() {
+            let same_row = (previous.y - line.y).abs() <= 1.0;
+            let similar_size = (previous.font_size - line.font_size).abs() <= 0.75;
+            if same_row && similar_size {
+                previous.cells.push(line);
+                continue;
+            }
+        }
+
+        rows.push(TableRowGroup {
+            y: line.y,
+            font_size: line.font_size,
+            cells: vec![line],
+        });
+    }
+
+    for row in &mut rows {
+        row.cells.sort_by(|left, right| {
+            left.x
+                .partial_cmp(&right.x)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
+    }
+
+    rows
+}
+
+fn row_has_distinct_columns(row: &TableRowGroup, body_font_size: f32) -> bool {
+    row.cells
+        .windows(2)
+        .all(|cells| (cells[1].x - cells[0].x) >= body_font_size * 4.0)
+}
+
+fn columns_align(column_positions: &[f32], row: &TableRowGroup, body_font_size: f32) -> bool {
+    let tolerance = body_font_size.max(10.0) * 1.5;
+    row.cells
+        .iter()
+        .zip(column_positions.iter())
+        .all(|(cell, expected)| (cell.x - *expected).abs() <= tolerance)
+}
+
+fn table_bounds(rows: &[TableRowGroup], body_font_size: f32) -> BoundingBox {
+    let left = rows
+        .iter()
+        .flat_map(|row| row.cells.iter().map(|cell| cell.x))
+        .fold(f32::INFINITY, f32::min);
+    let right = rows
+        .iter()
+        .flat_map(|row| row.cells.iter().map(|cell| cell.x))
+        .fold(f32::NEG_INFINITY, f32::max)
+        + body_font_size * 8.0;
+    let top = rows.first().map(|row| row.y + row.font_size).unwrap_or(0.0);
+    let bottom = rows.last().map(|row| row.y - row.font_size).unwrap_or(0.0);
+
+    BoundingBox {
+        left,
+        bottom,
+        right,
+        top,
+    }
+}
+
+fn find_caption_line(
+    lines: &[ExtractedLine],
+    blocked_ids: &HashSet<usize>,
+    bounds: BoundingBox,
+    kind: CaptionKind,
+) -> Option<CaptionCandidate> {
+    lines
+        .iter()
+        .filter(|line| !blocked_ids.contains(&line.id))
+        .filter_map(|line| {
+            let text = normalize_plain_line(&line.text);
+            if !matches_caption(&text, &kind) {
+                return None;
+            }
+
+            let vertical_distance = if line.y > bounds.top {
+                line.y - bounds.top
+            } else if line.y < bounds.bottom {
+                bounds.bottom - line.y
+            } else {
+                0.0
+            };
+            if vertical_distance > 72.0 {
+                return None;
+            }
+
+            let horizontal_close = line.x <= bounds.right + 48.0 && line.x >= bounds.left - 72.0;
+            if !horizontal_close {
+                return None;
+            }
+
+            let rank = if line.y >= bounds.top { 0usize } else { 1usize };
+            Some((vertical_distance, rank, line.id, line.y, text))
+        })
+        .min_by(|left, right| {
+            left.0
+                .partial_cmp(&right.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| right.3.partial_cmp(&left.3).unwrap_or(Ordering::Equal))
+        })
+        .map(|(_, _, id, y, text)| CaptionCandidate { id, text, y })
+}
+
+fn matches_caption(text: &str, kind: &CaptionKind) -> bool {
+    let lower = text.to_ascii_lowercase();
+
+    match kind {
+        CaptionKind::Image => {
+            lower.starts_with("figure ")
+                || lower.starts_with("figure:")
+                || lower.starts_with("fig. ")
+                || lower.starts_with("fig ")
+                || lower.starts_with("image ")
+                || lower.starts_with("image:")
+        }
+        CaptionKind::Table => lower.starts_with("table ") || lower.starts_with("table:"),
+    }
+}
+
+fn render_image_block(filename: &str, caption: Option<&str>) -> String {
+    match caption {
+        Some(caption) => format!(
+            "#figure(\n  image(\"assets/{filename}\"),\n  caption: [{}],\n)",
+            typst_bracket_text(caption)
+        ),
+        None => format!("#image(\"assets/{filename}\")"),
+    }
+}
+
+fn render_table_block(rows: &[Vec<String>], caption: Option<&str>) -> String {
+    let table = render_table(rows);
+
+    match caption {
+        Some(caption) => format!(
+            "#figure(\n  kind: table,\n  {table},\n  caption: [{}],\n)",
+            typst_bracket_text(caption)
+        ),
+        None => format!("#{table}"),
+    }
+}
+
+fn render_table(rows: &[Vec<String>]) -> String {
+    let columns = rows.first().map_or(0usize, |row| row.len());
+    let mut lines = vec![format!("table(\n    columns: {columns},")];
+
+    for row in rows {
+        for cell in row {
+            lines.push(format!("    [{}],", typst_bracket_text(cell)));
+        }
+    }
+
+    lines.push("  )".to_string());
+    lines.join("\n")
+}
+
+fn typst_bracket_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace('#', "\\#")
+}
+
+fn render_document_blocks(blocks: Vec<String>) -> String {
+    if blocks.is_empty() {
+        return "// No digital text could be extracted from the PDF.\n".to_string();
+    }
+
+    let mut output = blocks.join("\n\n");
+    output.push('\n');
+    output
+}
+
+fn render_text_blocks(lines: Vec<ExtractedLine>) -> Vec<String> {
     let lines = collapse_lines(lines);
     if lines.is_empty() {
-        return "// No digital text could be extracted from the PDF.\n".to_string();
+        return Vec::new();
     }
 
     let body_font_size = infer_body_font_size(&lines);
@@ -1972,9 +2692,7 @@ fn render_typst(lines: Vec<ExtractedLine>) -> String {
         blocks.push(paragraph.join(" "));
     }
 
-    let mut output = blocks.join("\n\n");
-    output.push('\n');
-    output
+    blocks
 }
 
 fn collapse_lines(mut lines: Vec<ExtractedLine>) -> Vec<ExtractedLine> {
