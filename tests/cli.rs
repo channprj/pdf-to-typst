@@ -76,6 +76,26 @@ struct ScannedPageSpec<'a> {
     draw_height: f32,
 }
 
+enum ImageObjectFilter {
+    Flate,
+}
+
+struct ImageObjectSpec<'a> {
+    name: &'a str,
+    width: usize,
+    height: usize,
+    color_space: &'a str,
+    bits_per_component: usize,
+    filter: ImageObjectFilter,
+    bytes: &'a [u8],
+}
+
+struct RichPageSpec<'a> {
+    lines: &'a [TextLine<'a>],
+    extra_commands: &'a [&'a str],
+    xobjects: &'a [&'a str],
+}
+
 fn pdf_escape(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
 
@@ -243,6 +263,117 @@ fn build_scanned_pdf(pages: &[ScannedPageSpec<'_>]) -> Vec<u8> {
             page.width,
             page.height,
             stream.len()
+        )
+        .into_bytes();
+        object.extend_from_slice(&stream);
+        object.extend_from_slice(b"\nendstream");
+        objects.push(object);
+    }
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            offsets.len()
+        )
+        .as_bytes(),
+    );
+
+    pdf
+}
+
+fn build_rich_pdf(pages: &[RichPageSpec<'_>], images: &[ImageObjectSpec<'_>]) -> Vec<u8> {
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!(
+            "<< /Type /Pages /Kids [{}] /Count {} >>",
+            (0..pages.len())
+                .map(|index| format!("{} 0 R", 3 + index as u32))
+                .collect::<Vec<_>>()
+                .join(" "),
+            pages.len()
+        )
+        .into_bytes(),
+    ];
+
+    let font_start = 3 + pages.len() as u32;
+    let body_font = font_start;
+    let heading_font = font_start + 1;
+    let code_font = font_start + 2;
+    let contents_start = font_start + 3;
+    let image_start = contents_start + pages.len() as u32;
+
+    for page_index in 0..pages.len() {
+        let contents_ref = contents_start + page_index as u32;
+        let xobject_map = pages[page_index]
+            .xobjects
+            .iter()
+            .map(|name| {
+                let image_index = images
+                    .iter()
+                    .position(|image| image.name == *name)
+                    .expect("page xobject should match an image object");
+                format!("/{name} {} 0 R", image_start + image_index as u32)
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let xobject_resources = if xobject_map.is_empty() {
+            String::new()
+        } else {
+            format!(" /XObject << {xobject_map} >>")
+        };
+
+        objects.push(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {body_font} 0 R /F2 {heading_font} 0 R /F3 {code_font} 0 R >>{xobject_resources} >> /Contents {contents_ref} 0 R >>"
+        ).into_bytes());
+    }
+
+    objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
+    objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>".to_vec());
+    objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".to_vec());
+
+    for page in pages {
+        let stream = compressed_stream(&page_stream(&PageSpec {
+            lines: page.lines,
+            extra_commands: page.extra_commands,
+        }));
+        let mut object = format!(
+            "<< /Length {} /Filter /FlateDecode >>\nstream\n",
+            stream.len()
+        )
+        .into_bytes();
+        object.extend_from_slice(&stream);
+        object.extend_from_slice(b"\nendstream");
+        objects.push(object);
+    }
+
+    for image in images {
+        let (stream, filter_name) = match image.filter {
+            ImageObjectFilter::Flate => (compressed_bytes(image.bytes), "FlateDecode"),
+        };
+        let mut object = format!(
+            "<< /Type /XObject /Subtype /Image /Width {} /Height {} /ColorSpace /{} /BitsPerComponent {} /Length {} /Filter /{} >>\nstream\n",
+            image.width,
+            image.height,
+            image.color_space,
+            image.bits_per_component,
+            stream.len(),
+            filter_name
         )
         .into_bytes();
         object.extend_from_slice(&stream);
@@ -727,4 +858,214 @@ EOF
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("warning: low-confidence OCR on page 1"));
     assert!(stderr.contains("generated Typst may contain recognition errors"));
+}
+
+#[test]
+fn rich_pdf_extracts_images_tables_and_captions_into_typst() {
+    let output_root = test_path("rich-elements");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let page = RichPageSpec {
+        lines: &[
+            TextLine {
+                font: "F2",
+                size: 18.0,
+                x: 72.0,
+                y: 736.0,
+                text: "Quarterly Summary",
+            },
+            TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 706.0,
+                text: "Rich content should survive the conversion.",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 500.0,
+                text: "Figure 1: Revenue heatmap",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 440.0,
+                text: "Table 1: Regional metrics",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 410.0,
+                text: "Region",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 220.0,
+                y: 410.0,
+                text: "Q1",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 340.0,
+                y: 410.0,
+                text: "Q2",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 392.0,
+                text: "APAC",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 220.0,
+                y: 392.0,
+                text: "12",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 340.0,
+                y: 392.0,
+                text: "18",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 374.0,
+                text: "EMEA",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 220.0,
+                y: 374.0,
+                text: "9",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 340.0,
+                y: 374.0,
+                text: "11",
+            },
+        ],
+        extra_commands: &["q", "192 0 0 108 72 548 cm", "/Im1 Do", "Q"],
+        xobjects: &["Im1"],
+    };
+    let image = ImageObjectSpec {
+        name: "Im1",
+        width: 2,
+        height: 2,
+        color_space: "DeviceRGB",
+        bits_per_component: 8,
+        filter: ImageObjectFilter::Flate,
+        bytes: &[
+            255, 0, 0, 0, 255, 0, //
+            0, 0, 255, 255, 255, 0,
+        ],
+    };
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&[page], &[image]));
+
+    let output = binary()
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(
+        output_dir
+            .join("assets")
+            .join("page-1-image-1.png")
+            .is_file()
+    );
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("= Quarterly Summary"));
+    assert!(main_typ.contains("Rich content should survive the conversion."));
+    assert!(main_typ.contains("#figure("));
+    assert!(main_typ.contains("image(\"assets/page-1-image-1.png\")"));
+    assert!(main_typ.contains("caption: [Figure 1: Revenue heatmap]"));
+    assert!(main_typ.contains("kind: table"));
+    assert!(main_typ.contains("caption: [Table 1: Regional metrics]"));
+    assert!(main_typ.contains("[Region]"));
+    assert!(main_typ.contains("[APAC]"));
+    assert!(main_typ.contains("[11]"));
+}
+
+#[test]
+fn degraded_rich_elements_are_recorded_when_images_cannot_be_extracted() {
+    let output_root = test_path("rich-degraded");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let page = RichPageSpec {
+        lines: &[
+            TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "This page still has readable text.",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 500.0,
+                text: "Figure 2: Unsupported color profile",
+            },
+        ],
+        extra_commands: &["q", "160 0 0 90 72 548 cm", "/ImBad Do", "Q"],
+        xobjects: &["ImBad"],
+    };
+    let image = ImageObjectSpec {
+        name: "ImBad",
+        width: 2,
+        height: 2,
+        color_space: "DeviceCMYK",
+        bits_per_component: 8,
+        filter: ImageObjectFilter::Flate,
+        bytes: &[
+            0, 255, 255, 0, 255, 0, 255, 0, //
+            255, 255, 0, 0, 0, 0, 0, 255,
+        ],
+    };
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&[page], &[image]));
+
+    let output = binary()
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(output.status.success());
+    assert_eq!(
+        read_to_string(&output_dir.join("main.typ")),
+        "This page still has readable text.\n\nFigure 2: Unsupported color profile\n"
+    );
+    assert!(
+        !output_dir
+            .join("assets")
+            .join("page-1-image-1.png")
+            .exists()
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("warning: degraded rich element on page 1"));
+    assert!(stderr.contains("image ImBad could not be extracted"));
 }
