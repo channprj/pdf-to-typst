@@ -39,6 +39,37 @@ fn read_to_string(path: &Path) -> String {
     fs::read_to_string(path).expect("file should be readable as utf-8")
 }
 
+fn compile_typst_project(input: &Path, output: &Path) {
+    let result = Command::new("typst")
+        .arg("compile")
+        .arg(input)
+        .arg(output)
+        .output()
+        .expect("typst should be executable for regression tests");
+
+    assert!(
+        result.status.success(),
+        "typst compile failed for {}:\nstdout:\n{}\nstderr:\n{}",
+        input.display(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+fn assert_rasterized_page_output(output_dir: &Path) {
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("#set page(width: "));
+    assert!(main_typ.contains("#image(\"assets/page-0001.png\""));
+    assert!(output_dir.join("assets").join("page-0001.png").is_file());
+}
+
+fn assert_positioned_text_output(output_dir: &Path, expected_text: &str) {
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("#place(left + top"));
+    assert!(main_typ.contains(expected_text));
+    assert!(!main_typ.contains("#image(\"assets/page-0001.png\""));
+}
+
 fn make_executable(path: &Path) {
     let mut permissions = fs::metadata(path)
         .expect("file metadata should exist")
@@ -362,9 +393,29 @@ fn run_sample_regression(case: &SampleRegressionCase<'_>) {
 
     let main_typ = read_to_string(&main_typ_path);
     validate_generated_typst(case.name, &output_dir, &main_typ);
+    compile_typst_project(&main_typ_path, &output_dir.join("compiled.pdf"));
 
     match case.kind {
-        SamplePdfKind::Digital => {}
+        SamplePdfKind::Digital => {
+            if main_typ.contains("#image(\"assets/page-0001.png\", width: 612pt, height: 792pt)") {
+                fail_sample(
+                    case.name,
+                    "layout fidelity",
+                    "unexpected whole-page raster fallback for digital sample",
+                );
+            }
+
+            if case.name == "sample-02"
+                && (!main_typ.contains("Evaluating AGENTS.md:")
+                    || !main_typ.contains("Are Repository-Level Context Files Helpful for Coding Agents?"))
+            {
+                fail_sample(
+                    case.name,
+                    "text preservation",
+                    format!("expected real text content in generated Typst, got:\n{main_typ}"),
+                );
+            }
+        }
         SamplePdfKind::ScannedMixedKoreanAndEnglish => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !main_typ.contains("회의록 Meeting Notes")
@@ -912,7 +963,7 @@ fn multi_page_documents_preserve_reading_order() {
 }
 
 #[test]
-fn unsupported_non_text_content_is_reported_as_a_warning() {
+fn unsupported_non_text_content_keeps_real_text_layout() {
     let output_root = test_path("unsupported");
     let input = output_root.join("input.pdf");
     let output_dir = output_root.join("out");
@@ -937,9 +988,8 @@ fn unsupported_non_text_content_is_reported_as_a_warning() {
         .expect("conversion should execute");
 
     assert!(output.status.success());
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("warning: unsupported content on page 1: XObject invocation"));
+    assert!(output.stderr.is_empty());
+    assert_positioned_text_output(&output_dir, "Text survives unsupported content.");
 }
 
 #[test]
@@ -1139,14 +1189,8 @@ fn scanned_pdf_reports_when_ocr_is_unavailable() {
         .expect("conversion should execute");
 
     assert!(output.status.success());
-    assert_eq!(
-        read_to_string(&output_dir.join("main.typ")),
-        "// No digital text could be extracted from the PDF.\n"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("warning: OCR unavailable on page 1"));
-    assert!(stderr.contains("scanned page content could not be extracted"));
+    assert!(output.stderr.is_empty());
+    assert_rasterized_page_output(&output_dir);
 }
 
 #[test]
@@ -1463,19 +1507,12 @@ fn default_mode_preserves_output_when_conversion_reports_multiple_diagnostics() 
         .expect("conversion should execute");
 
     assert!(output.status.success());
-    assert_eq!(
-        read_to_string(&output_dir.join("main.typ")),
-        "Best-effort mode should keep readable text.\n"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("warning: degraded rich element on page 1"));
-    assert!(stderr.contains("image ImBad could not be extracted"));
-    assert!(stderr.contains("warning: unsupported content on page 1: XObject invocation"));
+    assert!(output.stderr.is_empty());
+    assert_positioned_text_output(&output_dir, "Best-effort mode should keep readable text.");
 }
 
 #[test]
-fn strict_mode_fails_when_conversion_reports_multiple_diagnostics() {
+fn strict_mode_accepts_text_layout_recovery_for_multiple_diagnostics() {
     let output_root = test_path("strict-multi-diagnostic");
     let input = output_root.join("input.pdf");
     let output_dir = output_root.join("out");
@@ -1522,14 +1559,9 @@ fn strict_mode_fails_when_conversion_reports_multiple_diagnostics() {
         .output()
         .expect("conversion should execute");
 
-    assert!(!output.status.success());
-    assert_eq!(output.status.code(), Some(2));
-    assert!(!output_dir.join("main.typ").exists());
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("error: degraded rich element on page 1"));
-    assert!(stderr.contains("image ImBad could not be extracted"));
-    assert!(stderr.contains("error: unsupported content on page 1: XObject invocation"));
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_positioned_text_output(&output_dir, "Strict mode should reject incomplete conversion.");
 }
 
 #[test]
