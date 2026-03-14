@@ -1,2 +1,6 @@
-/target
-/.worktrees/
+.DS_Store
+target
+.worktrees/
+.ralph-tui/
+output/
+
