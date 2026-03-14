@@ -31,6 +31,8 @@ Options:
 
 const DEFAULT_OCR_LANGUAGES: &str = "kor+eng";
 const DEFAULT_OCR_MIN_CONFIDENCE: f32 = 65.0;
+const RASTER_FALLBACK_DPI: u32 = 144;
+const PDFKIT_RENDER_SCALE: f32 = 2.0;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CliOptions {
@@ -258,6 +260,8 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
     let mut blocks = Vec::new();
     let mut assets = Vec::new();
     let mut ocr_engine = OcrEngine::from_env();
+    let mut requires_raster_fallback = false;
+    let mut pdfkit_render_pages = HashSet::new();
 
     for (page_index, page_ref) in page_refs.iter().enumerate() {
         let page_number = page_index + 1;
@@ -314,6 +318,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
 
         assign_line_ids(&mut page_lines);
         let page_block_count_before = blocks.len();
+        let has_rich_regions = !page_xobjects.is_empty() || page_images.image_count > 0;
 
         if ocr_attempted {
             if page_lines.is_empty() {
@@ -335,7 +340,23 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
                 "unsupported content on page {page_number}: no digital text extracted"
             )));
         }
+        if has_rich_regions {
+            pdfkit_render_pages.insert(page_number);
+        }
+        if page_warnings
+            .iter()
+            .any(|warning| should_use_raster_fallback(warning.message()))
+        {
+            requires_raster_fallback = true;
+        }
         warnings.extend(dedupe_warnings(page_warnings));
+    }
+
+    if requires_raster_fallback {
+        if let Some(document) = convert_pdf_with_pdfkit(input_pdf, &pdfkit_render_pages)? {
+            return Ok(document);
+        }
+        return rasterize_pdf_to_typst(input_pdf);
     }
 
     Ok(ConvertedDocument {
@@ -354,6 +375,584 @@ struct ConvertedDocument {
 struct OutputAsset {
     filename: String,
     bytes: Vec<u8>,
+}
+
+struct RasterizedPage {
+    filename: String,
+    width_pt: f32,
+    height_pt: f32,
+}
+
+struct PdfkitPage {
+    number: usize,
+    width_pt: f32,
+    height_pt: f32,
+    render_path: PathBuf,
+    lines: Vec<PdfkitLine>,
+}
+
+struct PdfkitLine {
+    x_pt: f32,
+    y_pt: f32,
+    width_pt: f32,
+    height_pt: f32,
+    font_size_pt: f32,
+    font_name: String,
+    text: String,
+}
+
+struct PositionedAsset {
+    filename: String,
+    x_pt: f32,
+    y_pt: f32,
+    width_pt: f32,
+    height_pt: f32,
+}
+
+fn should_use_raster_fallback(message: &str) -> bool {
+    message.contains("vector drawing commands")
+        || message.contains("XObject invocation")
+        || message.contains("inline image data")
+        || message.contains("unsupported stream filter")
+        || message.contains("no digital text extracted")
+}
+
+fn convert_pdf_with_pdfkit(
+    input_pdf: &Path,
+    render_pages: &HashSet<usize>,
+) -> Result<Option<ConvertedDocument>, CliFailure> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let workspace = env::temp_dir().join(format!(
+        "pdf-to-typst-pdfkit-{}-{timestamp}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&workspace).map_err(|error| {
+        CliFailure::fatal(format!(
+            "error: failed to prepare PDFKit workspace {}: {error}",
+            workspace.display()
+        ))
+    })?;
+
+    let pages = match run_pdfkit_scene(input_pdf, &workspace, render_pages)? {
+        Some(pages) if pages.iter().any(|page| !page.lines.is_empty()) => pages,
+        _ => {
+            let _ = fs::remove_dir_all(&workspace);
+            return Ok(None);
+        }
+    };
+
+    let mut assets = Vec::new();
+    let mut blocks = Vec::new();
+
+    for page in &pages {
+        let positioned_assets = match detect_non_text_regions(page, &workspace)? {
+            Some(assets_for_page) => assets_for_page,
+            None => {
+                let _ = fs::remove_dir_all(&workspace);
+                return Ok(None);
+            }
+        };
+
+        blocks.push(format!(
+            "#set page(width: {}, height: {}, margin: 0pt)",
+            format_pt(page.width_pt),
+            format_pt(page.height_pt)
+        ));
+
+        for positioned in positioned_assets {
+            let bytes = fs::read(workspace.join(&positioned.filename)).map_err(|error| {
+                CliFailure::fatal(format!(
+                    "error: failed to read extracted region {}: {error}",
+                    positioned.filename
+                ))
+            })?;
+            assets.push(OutputAsset {
+                filename: positioned.filename.clone(),
+                bytes,
+            });
+            blocks.push(render_positioned_asset(&positioned));
+        }
+
+        for line in &page.lines {
+            blocks.push(render_positioned_line(page, line));
+        }
+
+        if page.number < pages.len() {
+            blocks.push("#pagebreak()".to_string());
+        }
+    }
+
+    let _ = fs::remove_dir_all(&workspace);
+
+    Ok(Some(ConvertedDocument {
+        typst: render_document_blocks(blocks),
+        assets,
+        warnings: Vec::new(),
+    }))
+}
+
+fn run_pdfkit_scene(
+    input_pdf: &Path,
+    workspace: &Path,
+    render_pages: &HashSet<usize>,
+) -> Result<Option<Vec<PdfkitPage>>, CliFailure> {
+    let helper_source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/pdfkit_scene.swift");
+    let helper_binary = env::temp_dir().join("pdf-to-typst-pdfkit-scene");
+    let module_cache = env::temp_dir().join("swift-module-cache");
+    let render_dir = workspace.join("renders");
+    fs::create_dir_all(&render_dir).map_err(|error| {
+        CliFailure::fatal(format!(
+            "error: failed to prepare PDFKit render directory {}: {error}",
+            render_dir.display()
+        ))
+    })?;
+    fs::create_dir_all(&module_cache).map_err(|error| {
+        CliFailure::fatal(format!(
+            "error: failed to prepare Swift module cache {}: {error}",
+            module_cache.display()
+        ))
+    })?;
+
+    let helper_needs_build = match (fs::metadata(&helper_binary), fs::metadata(&helper_source)) {
+        (Ok(binary_meta), Ok(source_meta)) => match (binary_meta.modified(), source_meta.modified()) {
+            (Ok(binary_mtime), Ok(source_mtime)) => binary_mtime < source_mtime,
+            _ => true,
+        },
+        _ => true,
+    };
+
+    if helper_needs_build {
+        let sdk_output = match Command::new("xcrun").arg("--show-sdk-path").output() {
+            Ok(output) if output.status.success() => output,
+            _ => return Ok(None),
+        };
+        let sdk_path = String::from_utf8_lossy(&sdk_output.stdout).trim().to_string();
+        if sdk_path.is_empty() {
+            return Ok(None);
+        }
+
+        let compile = match Command::new("xcrun")
+            .arg("swiftc")
+            .arg("-sdk")
+            .arg(&sdk_path)
+            .arg("-module-cache-path")
+            .arg(&module_cache)
+            .arg(&helper_source)
+            .arg("-o")
+            .arg(&helper_binary)
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => return Ok(None),
+        };
+
+        if !compile.status.success() {
+            return Ok(None);
+        }
+    }
+
+    let output = match Command::new(&helper_binary)
+        .arg(input_pdf)
+        .arg(&render_dir)
+        .arg(PDFKIT_RENDER_SCALE.to_string())
+        .arg(
+            render_pages
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|page| page.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let mut pages = Vec::<PdfkitPage>::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split('\t');
+        match parts.next() {
+            Some("PAGE") => {
+                let number = parts.next().and_then(|value| value.parse::<usize>().ok());
+                let width_pt = parts.next().and_then(|value| value.parse::<f32>().ok());
+                let height_pt = parts.next().and_then(|value| value.parse::<f32>().ok());
+                let render_path = parts.next().map(unescape_helper_field);
+                let (Some(number), Some(width_pt), Some(height_pt), Some(render_path)) =
+                    (number, width_pt, height_pt, render_path)
+                else {
+                    continue;
+                };
+                pages.push(PdfkitPage {
+                    number,
+                    width_pt,
+                    height_pt,
+                    render_path: PathBuf::from(render_path),
+                    lines: Vec::new(),
+                });
+            }
+            Some("LINE") => {
+                let number = parts.next().and_then(|value| value.parse::<usize>().ok());
+                let x_pt = parts.next().and_then(|value| value.parse::<f32>().ok());
+                let y_pt = parts.next().and_then(|value| value.parse::<f32>().ok());
+                let width_pt = parts.next().and_then(|value| value.parse::<f32>().ok());
+                let height_pt = parts.next().and_then(|value| value.parse::<f32>().ok());
+                let font_size_pt = parts.next().and_then(|value| value.parse::<f32>().ok());
+                let font_name = parts.next().map(unescape_helper_field);
+                let text = parts.next().map(unescape_helper_field);
+                let (
+                    Some(number),
+                    Some(x_pt),
+                    Some(y_pt),
+                    Some(width_pt),
+                    Some(height_pt),
+                    Some(font_size_pt),
+                    Some(font_name),
+                    Some(text),
+                ) = (number, x_pt, y_pt, width_pt, height_pt, font_size_pt, font_name, text)
+                else {
+                    continue;
+                };
+
+                if let Some(page) = pages.iter_mut().find(|page| page.number == number) {
+                    page.lines.push(PdfkitLine {
+                        x_pt,
+                        y_pt,
+                        width_pt,
+                        height_pt,
+                        font_size_pt,
+                        font_name,
+                        text,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok((!pages.is_empty()).then_some(pages))
+}
+
+fn detect_non_text_regions(
+    page: &PdfkitPage,
+    workspace: &Path,
+) -> Result<Option<Vec<PositionedAsset>>, CliFailure> {
+    if page.render_path.as_os_str().is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let boxes_path = workspace.join(format!("page-{:04}-boxes.tsv", page.number));
+    let regions_dir = workspace.join(format!("regions-page-{:04}", page.number));
+    fs::create_dir_all(&regions_dir).map_err(|error| {
+        CliFailure::fatal(format!(
+            "error: failed to prepare region directory {}: {error}",
+            regions_dir.display()
+        ))
+    })?;
+
+    let mut box_lines = String::new();
+    for line in &page.lines {
+        let left = (line.x_pt * PDFKIT_RENDER_SCALE).round().max(0.0) as i32;
+        let top = ((page.height_pt - line.y_pt - line.height_pt) * PDFKIT_RENDER_SCALE)
+            .round()
+            .max(0.0) as i32;
+        let width = (line.width_pt * PDFKIT_RENDER_SCALE).round().max(1.0) as i32;
+        let height = (line.height_pt * PDFKIT_RENDER_SCALE).round().max(1.0) as i32;
+        box_lines.push_str(&format!("{left}\t{top}\t{width}\t{height}\n"));
+    }
+    fs::write(&boxes_path, box_lines).map_err(|error| {
+        CliFailure::fatal(format!(
+            "error: failed to write text box mask {}: {error}",
+            boxes_path.display()
+        ))
+    })?;
+
+    let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/extract_non_text_regions.py");
+    let output = match Command::new("python3")
+        .arg(&helper)
+        .arg(&page.render_path)
+        .arg(&boxes_path)
+        .arg(&regions_dir)
+        .arg(format!("page-{:04}", page.number))
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Ok(None),
+    };
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let mut assets = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split('\t');
+        if parts.next() != Some("REGION") {
+            continue;
+        }
+
+        let left_px = parts.next().and_then(|value| value.parse::<f32>().ok());
+        let top_px = parts.next().and_then(|value| value.parse::<f32>().ok());
+        let width_px = parts.next().and_then(|value| value.parse::<f32>().ok());
+        let height_px = parts.next().and_then(|value| value.parse::<f32>().ok());
+        let path = parts.next();
+        let (Some(left_px), Some(top_px), Some(width_px), Some(height_px), Some(path)) =
+            (left_px, top_px, width_px, height_px, path)
+        else {
+            continue;
+        };
+
+        let filename = Path::new(path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("region.png")
+            .to_string();
+        assets.push(PositionedAsset {
+            filename,
+            x_pt: left_px / PDFKIT_RENDER_SCALE,
+            y_pt: top_px / PDFKIT_RENDER_SCALE,
+            width_pt: width_px / PDFKIT_RENDER_SCALE,
+            height_pt: height_px / PDFKIT_RENDER_SCALE,
+        });
+    }
+
+    Ok(Some(assets))
+}
+
+fn unescape_helper_field(field: &str) -> String {
+    let mut output = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('t') => output.push('\t'),
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('\\') => output.push('\\'),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    output
+}
+
+fn rasterize_pdf_to_typst(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = env::temp_dir().join(format!(
+        "pdf-to-typst-render-{}-{timestamp}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_dir).map_err(|error| {
+        CliFailure::fatal(format!(
+            "error: failed to prepare raster fallback workspace {}: {error}",
+            temp_dir.display()
+        ))
+    })?;
+
+    let output_pattern = temp_dir.join("page-%04d.png");
+    let ghostscript = env::var_os("PDF_TO_TYPST_GS_BIN").unwrap_or_else(|| OsString::from("gs"));
+    let output = Command::new(ghostscript)
+        .arg("-q")
+        .arg("-dSAFER")
+        .arg("-dBATCH")
+        .arg("-dNOPAUSE")
+        .arg("-sDEVICE=png16m")
+        .arg(format!("-r{RASTER_FALLBACK_DPI}"))
+        .arg("-o")
+        .arg(&output_pattern)
+        .arg(input_pdf)
+        .output()
+        .map_err(|error| {
+            CliFailure::fatal(format!(
+                "error: failed to launch Ghostscript raster fallback: {error}"
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        return Err(CliFailure::fatal(if detail.is_empty() {
+            "error: Ghostscript raster fallback failed".to_string()
+        } else {
+            format!("error: Ghostscript raster fallback failed: {detail}")
+        }));
+    }
+
+    let mut page_paths = fs::read_dir(&temp_dir)
+        .map_err(|error| {
+            CliFailure::fatal(format!(
+                "error: failed to inspect raster fallback output {}: {error}",
+                temp_dir.display()
+            ))
+        })?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|extension| extension == "png"))
+        .collect::<Vec<_>>();
+    page_paths.sort();
+
+    if page_paths.is_empty() {
+        return Err(CliFailure::fatal(
+            "error: Ghostscript raster fallback produced no pages",
+        ));
+    }
+
+    let mut assets = Vec::with_capacity(page_paths.len());
+    let mut pages = Vec::with_capacity(page_paths.len());
+
+    for (index, page_path) in page_paths.iter().enumerate() {
+        let bytes = fs::read(page_path).map_err(|error| {
+            CliFailure::fatal(format!(
+                "error: failed to read rasterized page {}: {error}",
+                page_path.display()
+            ))
+        })?;
+        let (width_px, height_px) = parse_png_dimensions(&bytes).map_err(|message| {
+            CliFailure::fatal(format!(
+                "error: failed to inspect rasterized page {}: {message}",
+                page_path.display()
+            ))
+        })?;
+        let filename = format!("page-{:04}.png", index + 1);
+        assets.push(OutputAsset {
+            filename: filename.clone(),
+            bytes,
+        });
+        pages.push(RasterizedPage {
+            filename,
+            width_pt: width_px as f32 * 72.0 / RASTER_FALLBACK_DPI as f32,
+            height_pt: height_px as f32 * 72.0 / RASTER_FALLBACK_DPI as f32,
+        });
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    Ok(ConvertedDocument {
+        typst: render_raster_document(&pages),
+        assets,
+        warnings: Vec::new(),
+    })
+}
+
+fn parse_png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+    if bytes.len() < 24 || &bytes[..8] != PNG_SIGNATURE {
+        return Err("not a PNG image".to_string());
+    }
+
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    if width == 0 || height == 0 {
+        return Err("PNG image has invalid dimensions".to_string());
+    }
+
+    Ok((width, height))
+}
+
+fn render_raster_document(pages: &[RasterizedPage]) -> String {
+    let mut blocks = Vec::with_capacity(pages.len() * 3);
+
+    for (index, page) in pages.iter().enumerate() {
+        let width = format_pt(page.width_pt);
+        let height = format_pt(page.height_pt);
+        blocks.push(format!(
+            "#set page(width: {width}, height: {height}, margin: 0pt)"
+        ));
+        blocks.push(format!(
+            "#image(\"assets/{}\", width: {width}, height: {height})",
+            page.filename
+        ));
+        if index + 1 < pages.len() {
+            blocks.push("#pagebreak()".to_string());
+        }
+    }
+
+    let mut output = blocks.join("\n\n");
+    output.push('\n');
+    output
+}
+
+fn format_pt(value: f32) -> String {
+    let rounded = (value * 100.0).round() / 100.0;
+    let mut text = format!("{rounded:.2}");
+    while text.ends_with('0') {
+        text.pop();
+    }
+    if text.ends_with('.') {
+        text.pop();
+    }
+    text.push_str("pt");
+    text
+}
+
+fn render_positioned_asset(asset: &PositionedAsset) -> String {
+    format!(
+        "#place(left + top, dx: {}, dy: {})[#image(\"assets/{}\", width: {}, height: {})]",
+        format_pt(asset.x_pt),
+        format_pt(asset.y_pt),
+        asset.filename,
+        format_pt(asset.width_pt),
+        format_pt(asset.height_pt)
+    )
+}
+
+fn render_positioned_line(page: &PdfkitPage, line: &PdfkitLine) -> String {
+    let top = page.height_pt - line.y_pt - line.height_pt;
+    let font_size = if line.font_size_pt.is_finite() && line.font_size_pt > 0.0 {
+        line.font_size_pt
+    } else {
+        line.height_pt.max(8.0)
+    };
+    let body = typst_string_literal(&line.text);
+    let x = format_pt(line.x_pt);
+    let y = format_pt(top.max(0.0));
+    let size = format_pt(font_size);
+
+    if let Some(font) = map_typst_font_name(&line.font_name) {
+        format!(
+            "#place(left + top, dx: {x}, dy: {y})[#text(size: {size}, font: \"{font}\", \"{body}\")]"
+        )
+    } else {
+        format!("#place(left + top, dx: {x}, dy: {y})[#text(size: {size}, \"{body}\")]")
+    }
+}
+
+fn map_typst_font_name(font_name: &str) -> Option<&'static str> {
+    let lower = font_name.to_ascii_lowercase();
+    if lower.contains("times") {
+        Some("Times New Roman")
+    } else if lower.contains("helvetica") {
+        Some("Helvetica")
+    } else if lower.contains("courier") {
+        Some("Courier New")
+    } else if lower.contains("arial") {
+        Some("Arial")
+    } else {
+        None
+    }
+}
+
+fn typst_string_literal(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 struct ParsedPdf {
