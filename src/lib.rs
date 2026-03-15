@@ -319,7 +319,9 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
         assign_line_ids(&mut page_lines);
         let page_block_count_before = blocks.len();
         let has_rich_regions = !page_xobjects.is_empty() || page_images.image_count > 0;
-
+        let has_visual_hint = page_lines
+            .iter()
+            .any(|line| looks_like_visual_hint_text(&line.text));
         if ocr_attempted {
             if page_lines.is_empty() {
                 page_warnings.push(Warning::new(format!(
@@ -340,7 +342,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
                 "unsupported content on page {page_number}: no digital text extracted"
             )));
         }
-        if has_rich_regions {
+        if has_rich_regions || has_visual_hint {
             pdfkit_render_pages.insert(page_number);
         }
         if page_warnings
@@ -391,6 +393,7 @@ struct PdfkitPage {
     lines: Vec<PdfkitLine>,
 }
 
+#[derive(Clone)]
 struct PdfkitLine {
     x_pt: f32,
     y_pt: f32,
@@ -401,8 +404,10 @@ struct PdfkitLine {
     text: String,
 }
 
+#[derive(Clone)]
 struct PositionedAsset {
     filename: String,
+    source_path: PathBuf,
     x_pt: f32,
     y_pt: f32,
     width_pt: f32,
@@ -419,7 +424,7 @@ fn should_use_raster_fallback(message: &str) -> bool {
 
 fn convert_pdf_with_pdfkit(
     input_pdf: &Path,
-    render_pages: &HashSet<usize>,
+    preferred_render_pages: &HashSet<usize>,
 ) -> Result<Option<ConvertedDocument>, CliFailure> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -436,11 +441,20 @@ fn convert_pdf_with_pdfkit(
         ))
     })?;
 
-    let pages = match run_pdfkit_scene(input_pdf, &workspace, render_pages)? {
+    let scene_pages = match run_pdfkit_scene(input_pdf, &workspace, &HashSet::new())? {
         Some(pages) if pages.iter().any(|page| !page.lines.is_empty()) => pages,
         _ => {
             let _ = fs::remove_dir_all(&workspace);
             return Ok(None);
+        }
+    };
+    let render_pages = collect_pdfkit_render_pages(&scene_pages, preferred_render_pages);
+    let pages = if render_pages.is_empty() {
+        scene_pages
+    } else {
+        match run_pdfkit_scene(input_pdf, &workspace, &render_pages)? {
+            Some(rendered_pages) => rendered_pages,
+            None => scene_pages,
         }
     };
 
@@ -448,13 +462,15 @@ fn convert_pdf_with_pdfkit(
     let mut blocks = Vec::new();
 
     for page in &pages {
-        let positioned_assets = match detect_non_text_regions(page, &workspace)? {
+        let detected_assets = match detect_non_text_regions(page, &workspace)? {
             Some(assets_for_page) => assets_for_page,
             None => {
                 let _ = fs::remove_dir_all(&workspace);
                 return Ok(None);
             }
         };
+        let positioned_assets = select_visual_regions(page, detected_assets);
+        let positioned_lines = filter_pdfkit_lines(page, &positioned_assets);
 
         blocks.push(format!(
             "#set page(width: {}, height: {}, margin: 0pt)",
@@ -462,11 +478,11 @@ fn convert_pdf_with_pdfkit(
             format_pt(page.height_pt)
         ));
 
-        for positioned in positioned_assets {
-            let bytes = fs::read(workspace.join(&positioned.filename)).map_err(|error| {
+        for positioned in &positioned_assets {
+            let bytes = fs::read(&positioned.source_path).map_err(|error| {
                 CliFailure::fatal(format!(
                     "error: failed to read extracted region {}: {error}",
-                    positioned.filename
+                    positioned.source_path.display()
                 ))
             })?;
             assets.push(OutputAsset {
@@ -476,7 +492,7 @@ fn convert_pdf_with_pdfkit(
             blocks.push(render_positioned_asset(&positioned));
         }
 
-        for line in &page.lines {
+        for line in &positioned_lines {
             blocks.push(render_positioned_line(page, line));
         }
 
@@ -494,14 +510,29 @@ fn convert_pdf_with_pdfkit(
     }))
 }
 
+fn collect_pdfkit_render_pages(
+    pages: &[PdfkitPage],
+    preferred_render_pages: &HashSet<usize>,
+) -> HashSet<usize> {
+    let mut render_pages = preferred_render_pages.clone();
+    for page in pages {
+        if page
+            .lines
+            .iter()
+            .any(|line| looks_like_visual_hint_text(&line.text))
+        {
+            render_pages.insert(page.number);
+        }
+    }
+    render_pages
+}
+
 fn run_pdfkit_scene(
     input_pdf: &Path,
     workspace: &Path,
     render_pages: &HashSet<usize>,
 ) -> Result<Option<Vec<PdfkitPage>>, CliFailure> {
     let helper_source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/pdfkit_scene.swift");
-    let helper_binary = env::temp_dir().join("pdf-to-typst-pdfkit-scene");
-    let module_cache = env::temp_dir().join("swift-module-cache");
     let render_dir = workspace.join("renders");
     fs::create_dir_all(&render_dir).map_err(|error| {
         CliFailure::fatal(format!(
@@ -509,52 +540,11 @@ fn run_pdfkit_scene(
             render_dir.display()
         ))
     })?;
-    fs::create_dir_all(&module_cache).map_err(|error| {
-        CliFailure::fatal(format!(
-            "error: failed to prepare Swift module cache {}: {error}",
-            module_cache.display()
-        ))
-    })?;
-
-    let helper_needs_build = match (fs::metadata(&helper_binary), fs::metadata(&helper_source)) {
-        (Ok(binary_meta), Ok(source_meta)) => match (binary_meta.modified(), source_meta.modified()) {
-            (Ok(binary_mtime), Ok(source_mtime)) => binary_mtime < source_mtime,
-            _ => true,
-        },
-        _ => true,
+    let Some(helper_binary) = resolve_pdfkit_helper(&helper_source) else {
+        return Ok(None);
     };
 
-    if helper_needs_build {
-        let sdk_output = match Command::new("xcrun").arg("--show-sdk-path").output() {
-            Ok(output) if output.status.success() => output,
-            _ => return Ok(None),
-        };
-        let sdk_path = String::from_utf8_lossy(&sdk_output.stdout).trim().to_string();
-        if sdk_path.is_empty() {
-            return Ok(None);
-        }
-
-        let compile = match Command::new("xcrun")
-            .arg("swiftc")
-            .arg("-sdk")
-            .arg(&sdk_path)
-            .arg("-module-cache-path")
-            .arg(&module_cache)
-            .arg(&helper_source)
-            .arg("-o")
-            .arg(&helper_binary)
-            .output()
-        {
-            Ok(output) => output,
-            Err(_) => return Ok(None),
-        };
-
-        if !compile.status.success() {
-            return Ok(None);
-        }
-    }
-
-    let output = match Command::new(&helper_binary)
+    let output = match Command::new(helper_binary)
         .arg(input_pdf)
         .arg(&render_dir)
         .arg(PDFKIT_RENDER_SCALE.to_string())
@@ -618,7 +608,16 @@ fn run_pdfkit_scene(
                     Some(font_size_pt),
                     Some(font_name),
                     Some(text),
-                ) = (number, x_pt, y_pt, width_pt, height_pt, font_size_pt, font_name, text)
+                ) = (
+                    number,
+                    x_pt,
+                    y_pt,
+                    width_pt,
+                    height_pt,
+                    font_size_pt,
+                    font_name,
+                    text,
+                )
                 else {
                     continue;
                 };
@@ -642,6 +641,89 @@ fn run_pdfkit_scene(
     Ok((!pages.is_empty()).then_some(pages))
 }
 
+fn resolve_pdfkit_helper(helper_source: &Path) -> Option<PathBuf> {
+    let helper_binary = env::temp_dir().join("pdf-to-typst-pdfkit-scene");
+    let module_cache = env::temp_dir().join("swift-module-cache");
+    let lock_path = env::temp_dir().join("pdf-to-typst-pdfkit-scene.lock");
+    let _lock = acquire_pdfkit_build_lock(&lock_path)?;
+
+    if fs::create_dir_all(&module_cache).is_err() {
+        return None;
+    }
+
+    let helper_needs_build = match (fs::metadata(&helper_binary), fs::metadata(helper_source)) {
+        (Ok(binary_meta), Ok(source_meta)) => {
+            match (binary_meta.modified(), source_meta.modified()) {
+                (Ok(binary_mtime), Ok(source_mtime)) => binary_mtime < source_mtime,
+                _ => true,
+            }
+        }
+        _ => true,
+    };
+
+    if helper_needs_build {
+        let sdk_output = match Command::new("xcrun").arg("--show-sdk-path").output() {
+            Ok(output) if output.status.success() => output,
+            _ => return None,
+        };
+        let sdk_path = String::from_utf8_lossy(&sdk_output.stdout)
+            .trim()
+            .to_string();
+        if sdk_path.is_empty() {
+            return None;
+        }
+
+        let compile = match Command::new("xcrun")
+            .arg("swiftc")
+            .arg("-sdk")
+            .arg(&sdk_path)
+            .arg("-module-cache-path")
+            .arg(&module_cache)
+            .arg(helper_source)
+            .arg("-o")
+            .arg(&helper_binary)
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => return None,
+        };
+
+        if !compile.status.success() {
+            return None;
+        }
+    }
+
+    Some(helper_binary)
+}
+
+struct PdfkitBuildLock {
+    path: PathBuf,
+}
+
+impl Drop for PdfkitBuildLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn acquire_pdfkit_build_lock(lock_path: &Path) -> Option<PdfkitBuildLock> {
+    for _ in 0..400 {
+        match fs::create_dir(lock_path) {
+            Ok(()) => {
+                return Some(PdfkitBuildLock {
+                    path: lock_path.to_path_buf(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
+    }
+
+    None
+}
+
 fn detect_non_text_regions(
     page: &PdfkitPage,
     workspace: &Path,
@@ -649,6 +731,22 @@ fn detect_non_text_regions(
     if page.render_path.as_os_str().is_empty() {
         return Ok(Some(Vec::new()));
     }
+
+    let render_bytes = fs::read(&page.render_path).map_err(|error| {
+        CliFailure::fatal(format!(
+            "error: failed to read PDFKit render {}: {error}",
+            page.render_path.display()
+        ))
+    })?;
+    let (render_width_px, render_height_px) =
+        parse_png_dimensions(&render_bytes).map_err(|message| {
+            CliFailure::fatal(format!(
+                "error: failed to inspect PDFKit render {}: {message}",
+                page.render_path.display()
+            ))
+        })?;
+    let scale_x = render_width_px as f32 / page.width_pt.max(1.0);
+    let scale_y = render_height_px as f32 / page.height_pt.max(1.0);
 
     let boxes_path = workspace.join(format!("page-{:04}-boxes.tsv", page.number));
     let regions_dir = workspace.join(format!("regions-page-{:04}", page.number));
@@ -661,12 +759,12 @@ fn detect_non_text_regions(
 
     let mut box_lines = String::new();
     for line in &page.lines {
-        let left = (line.x_pt * PDFKIT_RENDER_SCALE).round().max(0.0) as i32;
-        let top = ((page.height_pt - line.y_pt - line.height_pt) * PDFKIT_RENDER_SCALE)
+        let left = (line.x_pt * scale_x).round().max(0.0) as i32;
+        let top = ((page.height_pt - line.y_pt - line.height_pt) * scale_y)
             .round()
             .max(0.0) as i32;
-        let width = (line.width_pt * PDFKIT_RENDER_SCALE).round().max(1.0) as i32;
-        let height = (line.height_pt * PDFKIT_RENDER_SCALE).round().max(1.0) as i32;
+        let width = (line.width_pt * scale_x).round().max(1.0) as i32;
+        let height = (line.height_pt * scale_y).round().max(1.0) as i32;
         box_lines.push_str(&format!("{left}\t{top}\t{width}\t{height}\n"));
     }
     fs::write(&boxes_path, box_lines).map_err(|error| {
@@ -676,7 +774,8 @@ fn detect_non_text_regions(
         ))
     })?;
 
-    let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/extract_non_text_regions.py");
+    let helper =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/extract_non_text_regions.py");
     let output = match Command::new("python3")
         .arg(&helper)
         .arg(&page.render_path)
@@ -718,14 +817,193 @@ fn detect_non_text_regions(
             .to_string();
         assets.push(PositionedAsset {
             filename,
-            x_pt: left_px / PDFKIT_RENDER_SCALE,
-            y_pt: top_px / PDFKIT_RENDER_SCALE,
-            width_pt: width_px / PDFKIT_RENDER_SCALE,
-            height_pt: height_px / PDFKIT_RENDER_SCALE,
+            source_path: PathBuf::from(path),
+            x_pt: left_px / scale_x,
+            y_pt: top_px / scale_y,
+            width_pt: width_px / scale_x,
+            height_pt: height_px / scale_y,
         });
     }
 
+    assets.sort_by(|left, right| {
+        left.y_pt
+            .partial_cmp(&right.y_pt)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                left.x_pt
+                    .partial_cmp(&right.x_pt)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+
     Ok(Some(assets))
+}
+
+fn select_visual_regions(page: &PdfkitPage, assets: Vec<PositionedAsset>) -> Vec<PositionedAsset> {
+    if assets.is_empty() {
+        return assets;
+    }
+
+    let page_area = (page.width_pt * page.height_pt).max(1.0);
+    let has_visual_caption = page
+        .lines
+        .iter()
+        .any(|line| looks_like_visual_caption(&line.text));
+    let total_area = assets.iter().map(positioned_asset_area).sum::<f32>();
+    let largest_area = assets
+        .iter()
+        .map(positioned_asset_area)
+        .fold(0.0_f32, f32::max);
+
+    let filtered = assets
+        .into_iter()
+        .filter(|asset| {
+            let area = positioned_asset_area(asset);
+            area >= page_area * 0.003 || asset.width_pt >= 72.0 || asset.height_pt >= 72.0
+        })
+        .collect::<Vec<_>>();
+
+    if has_visual_caption || largest_area >= page_area * 0.03 || total_area >= page_area * 0.06 {
+        filtered
+    } else {
+        Vec::new()
+    }
+}
+
+fn positioned_asset_area(asset: &PositionedAsset) -> f32 {
+    asset.width_pt.max(0.0) * asset.height_pt.max(0.0)
+}
+
+fn looks_like_visual_caption(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    lower.starts_with("figure ")
+        || lower.starts_with("fig. ")
+        || lower.starts_with("table ")
+        || lower.starts_with("chart ")
+        || lower.starts_with("diagram ")
+}
+
+fn looks_like_visual_hint_text(text: &str) -> bool {
+    looks_like_visual_caption(text) || (text.contains('{') && text.contains('}'))
+}
+
+fn filter_pdfkit_lines(page: &PdfkitPage, assets: &[PositionedAsset]) -> Vec<PdfkitLine> {
+    let lines = page
+        .lines
+        .iter()
+        .filter(|line| !line_belongs_to_visual_region(page, line, assets))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    dedupe_pdfkit_lines(lines)
+}
+
+fn line_belongs_to_visual_region(
+    page: &PdfkitPage,
+    line: &PdfkitLine,
+    assets: &[PositionedAsset],
+) -> bool {
+    if assets.is_empty() || looks_like_visual_caption(&line.text) {
+        return false;
+    }
+
+    let line_left = line.x_pt;
+    let line_top = (page.height_pt - line.y_pt - line.height_pt).max(0.0);
+    let line_right = line_left + line.width_pt;
+    let line_bottom = line_top + line.height_pt;
+    let line_area = (line.width_pt * line.height_pt).max(1.0);
+    let center_x = line_left + line.width_pt / 2.0;
+    let center_y = line_top + line.height_pt / 2.0;
+
+    assets.iter().any(|asset| {
+        if center_x < asset.x_pt
+            || center_x > asset.x_pt + asset.width_pt
+            || center_y < asset.y_pt
+            || center_y > asset.y_pt + asset.height_pt
+        {
+            return false;
+        }
+
+        let overlap = rect_intersection_area(
+            line_left,
+            line_top,
+            line_right,
+            line_bottom,
+            asset.x_pt,
+            asset.y_pt,
+            asset.x_pt + asset.width_pt,
+            asset.y_pt + asset.height_pt,
+        );
+
+        overlap / line_area >= 0.7
+    })
+}
+
+fn dedupe_pdfkit_lines(lines: Vec<PdfkitLine>) -> Vec<PdfkitLine> {
+    let mut deduped = Vec::<PdfkitLine>::new();
+
+    'candidate: for line in lines {
+        for existing in deduped.iter_mut() {
+            if !pdfkit_lines_are_duplicates(existing, &line) {
+                continue;
+            }
+
+            if line.text.len() > existing.text.len()
+                || (line.width_pt * line.height_pt) > (existing.width_pt * existing.height_pt)
+            {
+                *existing = line;
+            }
+            continue 'candidate;
+        }
+
+        deduped.push(line);
+    }
+
+    deduped
+}
+
+fn pdfkit_lines_are_duplicates(left: &PdfkitLine, right: &PdfkitLine) -> bool {
+    let left_text = normalize_pdfkit_line_text(&left.text);
+    let right_text = normalize_pdfkit_line_text(&right.text);
+    if left_text.is_empty() || left_text != right_text {
+        return false;
+    }
+
+    let min_area = (left.width_pt * left.height_pt)
+        .min(right.width_pt * right.height_pt)
+        .max(1.0);
+    let overlap = rect_intersection_area(
+        left.x_pt,
+        left.y_pt,
+        left.x_pt + left.width_pt,
+        left.y_pt + left.height_pt,
+        right.x_pt,
+        right.y_pt,
+        right.x_pt + right.width_pt,
+        right.y_pt + right.height_pt,
+    );
+
+    overlap / min_area >= 0.75
+        || ((left.x_pt - right.x_pt).abs() <= 2.0 && (left.y_pt - right.y_pt).abs() <= 2.0)
+}
+
+fn normalize_pdfkit_line_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn rect_intersection_area(
+    left_x0: f32,
+    left_y0: f32,
+    left_x1: f32,
+    left_y1: f32,
+    right_x0: f32,
+    right_y0: f32,
+    right_x1: f32,
+    right_y1: f32,
+) -> f32 {
+    let width = (left_x1.min(right_x1) - left_x0.max(right_x0)).max(0.0);
+    let height = (left_y1.min(right_y1) - left_y0.max(right_y0)).max(0.0);
+    width * height
 }
 
 fn unescape_helper_field(field: &str) -> String {
@@ -3593,4 +3871,148 @@ fn max_backtick_run(input: &str) -> usize {
     }
 
     max_run
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_pdfkit_page(lines: Vec<PdfkitLine>) -> PdfkitPage {
+        PdfkitPage {
+            number: 1,
+            width_pt: 612.0,
+            height_pt: 792.0,
+            render_path: PathBuf::from("/tmp/page-0001.png"),
+            lines,
+        }
+    }
+
+    fn sample_region(x_pt: f32, y_pt: f32, width_pt: f32, height_pt: f32) -> PositionedAsset {
+        PositionedAsset {
+            filename: "page-0001-region-001.png".to_string(),
+            source_path: PathBuf::from("/tmp/page-0001-region-001.png"),
+            x_pt,
+            y_pt,
+            width_pt,
+            height_pt,
+        }
+    }
+
+    #[test]
+    fn suppresses_pdfkit_lines_inside_visual_regions() {
+        let page = sample_pdfkit_page(vec![
+            PdfkitLine {
+                x_pt: 100.0,
+                y_pt: 560.0,
+                width_pt: 80.0,
+                height_pt: 16.0,
+                font_size_pt: 10.0,
+                font_name: "Helvetica".to_string(),
+                text: "{tool_output}".to_string(),
+            },
+            PdfkitLine {
+                x_pt: 55.0,
+                y_pt: 223.0,
+                width_pt: 320.0,
+                height_pt: 16.0,
+                font_size_pt: 9.0,
+                font_name: "Helvetica".to_string(),
+                text: "Figure 1. Overview of our evaluation pipeline.".to_string(),
+            },
+        ]);
+
+        let kept = filter_pdfkit_lines(&page, &[sample_region(80.0, 200.0, 220.0, 80.0)]);
+        let texts = kept
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            texts,
+            vec!["Figure 1. Overview of our evaluation pipeline."]
+        );
+    }
+
+    #[test]
+    fn dedupes_overlapping_pdfkit_lines_with_same_text() {
+        let deduped = dedupe_pdfkit_lines(vec![
+            PdfkitLine {
+                x_pt: 72.0,
+                y_pt: 300.0,
+                width_pt: 120.0,
+                height_pt: 14.0,
+                font_size_pt: 10.0,
+                font_name: "Helvetica".to_string(),
+                text: "same text".to_string(),
+            },
+            PdfkitLine {
+                x_pt: 72.5,
+                y_pt: 300.5,
+                width_pt: 121.0,
+                height_pt: 14.0,
+                font_size_pt: 10.0,
+                font_name: "Helvetica".to_string(),
+                text: "same   text".to_string(),
+            },
+            PdfkitLine {
+                x_pt: 220.0,
+                y_pt: 280.0,
+                width_pt: 80.0,
+                height_pt: 14.0,
+                font_size_pt: 10.0,
+                font_name: "Helvetica".to_string(),
+                text: "different".to_string(),
+            },
+        ]);
+
+        let texts = deduped
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["same   text", "different"]);
+    }
+
+    #[test]
+    fn detects_placeholder_text_as_visual_hint() {
+        assert!(looks_like_visual_hint_text("{pr_patch}"));
+        assert!(looks_like_visual_hint_text(
+            "Tool output (if any) {tool_output}"
+        ));
+        assert!(!looks_like_visual_hint_text(
+            "This is ordinary paragraph text."
+        ));
+    }
+
+    #[test]
+    fn collects_pdfkit_render_pages_from_visual_hints() {
+        let pages = vec![
+            sample_pdfkit_page(vec![PdfkitLine {
+                x_pt: 10.0,
+                y_pt: 10.0,
+                width_pt: 20.0,
+                height_pt: 10.0,
+                font_size_pt: 9.0,
+                font_name: "Helvetica".to_string(),
+                text: "Ordinary body text".to_string(),
+            }]),
+            PdfkitPage {
+                number: 2,
+                width_pt: 612.0,
+                height_pt: 792.0,
+                render_path: PathBuf::new(),
+                lines: vec![PdfkitLine {
+                    x_pt: 10.0,
+                    y_pt: 10.0,
+                    width_pt: 40.0,
+                    height_pt: 10.0,
+                    font_size_pt: 9.0,
+                    font_name: "Helvetica".to_string(),
+                    text: "{tool_output}".to_string(),
+                }],
+            },
+        ];
+
+        let render_pages = collect_pdfkit_render_pages(&pages, &HashSet::from([4usize]));
+        assert_eq!(render_pages, HashSet::from([2usize, 4usize]));
+    }
 }
