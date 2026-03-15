@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 BOX_RE = re.compile(
-    r"^\s*(\d+):\s+(\d+)x(\d+)\+(\d+)\+(\d+)\s+[^ ]+\s+([^ ]+)\s+gray\(0\)"
+    r"^\s*(\d+):\s+(\d+)x(\d+)\+(\d+)\+(\d+)\s+[^ ]+\s+([^ ]+)\s+graya?\(([^,)]+)"
 )
 
 
@@ -45,7 +45,7 @@ def parse_components(output: str, page_width: int, page_height: int) -> list[tup
         match = BOX_RE.match(line)
         if not match:
             continue
-        object_id, width, height, left, top, area = match.groups()
+        object_id, width, height, left, top, area, color = match.groups()
         if object_id == "0":
             continue
 
@@ -54,10 +54,13 @@ def parse_components(output: str, page_width: int, page_height: int) -> list[tup
         left_i = int(left)
         top_i = int(top)
         area_i = int(float(area))
+        color_i = float(color)
 
         if width_i < 18 or height_i < 18 or area_i < 600:
             continue
         if area_i > page_area * 0.85:
+            continue
+        if color_i >= 128:
             continue
         boxes.append((left_i, top_i, width_i, height_i))
 
