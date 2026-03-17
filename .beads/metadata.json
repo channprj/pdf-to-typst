@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "pdf_to_typst",
+  "project_id": "0be182a0-2aef-48b6-98e7-17d7f80281f0"
+}

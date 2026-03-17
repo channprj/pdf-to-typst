@@ -4,3 +4,7 @@ target
 .ralph-tui/
 output/
 
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
