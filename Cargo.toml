@@ -2,6 +2,12 @@
 name = "pdf-to-typst"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Convert PDF documents into editable Typst projects"
+repository = "https://github.com/channprj/pdf-to-typst"
+readme = "README.md"
+keywords = ["pdf", "typst", "converter", "ocr"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 flate2 = "1.1.9"

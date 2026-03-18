@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::Compression;
@@ -33,6 +34,28 @@ const DEFAULT_OCR_LANGUAGES: &str = "kor+eng";
 const DEFAULT_OCR_MIN_CONFIDENCE: f32 = 65.0;
 const RASTER_FALLBACK_DPI: u32 = 144;
 const PDFKIT_RENDER_SCALE: f32 = 2.0;
+
+fn tools_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        if let Ok(dir) = env::var("PDF_TO_TYPST_TOOLS_DIR") {
+            return PathBuf::from(dir);
+        }
+        if let Ok(exe) = env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            let homebrew = parent.join("../lib/pdf-to-typst/tools");
+            if homebrew.is_dir() {
+                return homebrew;
+            }
+            let sibling = parent.join("tools");
+            if sibling.is_dir() {
+                return sibling;
+            }
+        }
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools")
+    })
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct CliOptions {
@@ -499,7 +522,7 @@ fn run_pdfkit_scene(
     workspace: &Path,
     render_pages: &HashSet<usize>,
 ) -> Result<Option<Vec<PdfkitPage>>, CliFailure> {
-    let helper_source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/pdfkit_scene.swift");
+    let helper_source = tools_dir().join("pdfkit_scene.swift");
     let helper_binary = env::temp_dir().join("pdf-to-typst-pdfkit-scene");
     let module_cache = env::temp_dir().join("swift-module-cache");
     let render_dir = workspace.join("renders");
@@ -517,10 +540,12 @@ fn run_pdfkit_scene(
     })?;
 
     let helper_needs_build = match (fs::metadata(&helper_binary), fs::metadata(&helper_source)) {
-        (Ok(binary_meta), Ok(source_meta)) => match (binary_meta.modified(), source_meta.modified()) {
-            (Ok(binary_mtime), Ok(source_mtime)) => binary_mtime < source_mtime,
-            _ => true,
-        },
+        (Ok(binary_meta), Ok(source_meta)) => {
+            match (binary_meta.modified(), source_meta.modified()) {
+                (Ok(binary_mtime), Ok(source_mtime)) => binary_mtime < source_mtime,
+                _ => true,
+            }
+        }
         _ => true,
     };
 
@@ -529,7 +554,9 @@ fn run_pdfkit_scene(
             Ok(output) if output.status.success() => output,
             _ => return Ok(None),
         };
-        let sdk_path = String::from_utf8_lossy(&sdk_output.stdout).trim().to_string();
+        let sdk_path = String::from_utf8_lossy(&sdk_output.stdout)
+            .trim()
+            .to_string();
         if sdk_path.is_empty() {
             return Ok(None);
         }
@@ -618,7 +645,16 @@ fn run_pdfkit_scene(
                     Some(font_size_pt),
                     Some(font_name),
                     Some(text),
-                ) = (number, x_pt, y_pt, width_pt, height_pt, font_size_pt, font_name, text)
+                ) = (
+                    number,
+                    x_pt,
+                    y_pt,
+                    width_pt,
+                    height_pt,
+                    font_size_pt,
+                    font_name,
+                    text,
+                )
                 else {
                     continue;
                 };
@@ -676,7 +712,7 @@ fn detect_non_text_regions(
         ))
     })?;
 
-    let helper = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/extract_non_text_regions.py");
+    let helper = tools_dir().join("extract_non_text_regions.py");
     let output = match Command::new("python3")
         .arg(&helper)
         .arg(&page.render_path)
@@ -2446,10 +2482,7 @@ fn parse_ocr_tsv(tsv: &str, page_number: usize) -> Result<ParsedOcrPage, String>
             .fold(0.0, f32::max);
     }
 
-    let mut groups = groups
-        .into_iter()
-        .map(|(_, group)| group)
-        .collect::<Vec<_>>();
+    let mut groups = groups.into_values().collect::<Vec<_>>();
     groups.sort_by(|left, right| {
         left.top
             .partial_cmp(&right.top)
@@ -2855,7 +2888,7 @@ fn decode_text_bytes(bytes: &[u8]) -> String {
     }
 
     let zero_bytes = bytes.iter().filter(|byte| **byte == 0).count();
-    if zero_bytes * 4 >= bytes.len().max(1) && bytes.len() % 2 == 0 {
+    if zero_bytes * 4 >= bytes.len().max(1) && bytes.len().is_multiple_of(2) {
         return decode_utf16(bytes, true);
     }
 
@@ -2890,9 +2923,7 @@ fn normalize_extracted_text(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
 
     for ch in text.chars() {
-        if ch == '\n' || ch == '\r' {
-            normalized.push(' ');
-        } else if ch.is_control() && ch != '\t' {
+        if ch == '\n' || ch == '\r' || (ch.is_control() && ch != '\t') {
             normalized.push(' ');
         } else {
             normalized.push(ch);
@@ -3023,7 +3054,7 @@ fn render_page(
         .map(PageEvent::Text)
         .collect::<Vec<_>>();
     events.extend(rich_elements.into_iter().map(PageEvent::Rich));
-    events.sort_by(|left, right| page_event_sort_key(left, right));
+    events.sort_by(page_event_sort_key);
 
     let mut blocks = Vec::new();
     let mut text_chunk = Vec::new();
