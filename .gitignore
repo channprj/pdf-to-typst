@@ -1,5 +1,7 @@
 .DS_Store
 target
+.codex/
+.claude/
 .worktrees/
 .ralph-tui/
 output/
@@ -8,3 +10,4 @@ output/
 # Dolt database files (added by bd init)
 .dolt/
 *.db
+

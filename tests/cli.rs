@@ -407,7 +407,8 @@ fn run_sample_regression(case: &SampleRegressionCase<'_>) {
 
             if case.name == "sample-02"
                 && (!main_typ.contains("Evaluating AGENTS.md:")
-                    || !main_typ.contains("Are Repository-Level Context Files Helpful for Coding Agents?"))
+                    || !main_typ
+                        .contains("Are Repository-Level Context Files Helpful for Coding Agents?"))
             {
                 fail_sample(
                     case.name,
@@ -1561,7 +1562,10 @@ fn strict_mode_accepts_text_layout_recovery_for_multiple_diagnostics() {
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    assert_positioned_text_output(&output_dir, "Strict mode should reject incomplete conversion.");
+    assert_positioned_text_output(
+        &output_dir,
+        "Strict mode should reject incomplete conversion.",
+    );
 }
 
 #[test]
