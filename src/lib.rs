@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -280,11 +280,10 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
     }
 
     let mut warnings = Vec::new();
-    let mut blocks = Vec::new();
-    let mut assets = Vec::new();
+    let mut pages = Vec::with_capacity(page_refs.len());
     let mut ocr_engine = OcrEngine::from_env();
-    let mut requires_raster_fallback = false;
     let mut pdfkit_render_pages = HashSet::new();
+    let mut raster_fallback_pages = BTreeSet::new();
 
     for (page_index, page_ref) in page_refs.iter().enumerate() {
         let page_number = page_index + 1;
@@ -340,8 +339,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
         }
 
         assign_line_ids(&mut page_lines);
-        let page_block_count_before = blocks.len();
-        let has_rich_regions = !page_xobjects.is_empty() || page_images.image_count > 0;
+        let mut page_fragment = None;
 
         if ocr_attempted {
             if page_lines.is_empty() {
@@ -349,37 +347,106 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
                     "unsupported content on page {page_number}: no digital text extracted"
                 )));
             } else {
-                blocks.extend(render_text_blocks(page_lines));
+                page_fragment = Some(PageFragment {
+                    blocks: render_text_blocks(page_lines),
+                    assets: Vec::new(),
+                    layout: PageLayoutMode::Flow,
+                });
             }
         } else {
             let rendered = render_page(page_number, page_lines, page_xobjects, page_images);
-            blocks.extend(rendered.blocks);
             page_warnings.extend(rendered.warnings);
-            assets.extend(rendered.assets);
+            if rendered.blocks.is_empty() {
+                page_warnings.push(Warning::new(format!(
+                    "unsupported content on page {page_number}: no digital text extracted"
+                )));
+            } else {
+                page_fragment = Some(PageFragment {
+                    blocks: rendered.blocks,
+                    assets: rendered.assets,
+                    layout: PageLayoutMode::Flow,
+                });
+            }
         }
 
-        if blocks.len() == page_block_count_before && !ocr_attempted {
-            page_warnings.push(Warning::new(format!(
-                "unsupported content on page {page_number}: no digital text extracted"
-            )));
+        match page_recovery_for_warnings(&page_warnings) {
+            Some(PageRecovery::Pdfkit) => {
+                pdfkit_render_pages.insert(page_number);
+                pages.push(PageAssembly {
+                    number: page_number,
+                    fragment: None,
+                });
+            }
+            Some(PageRecovery::Raster) => {
+                raster_fallback_pages.insert(page_number);
+                pages.push(PageAssembly {
+                    number: page_number,
+                    fragment: None,
+                });
+            }
+            None => {
+                warnings.extend(dedupe_warnings(page_warnings));
+                pages.push(PageAssembly {
+                    number: page_number,
+                    fragment: page_fragment,
+                });
+            }
         }
-        if has_rich_regions {
-            pdfkit_render_pages.insert(page_number);
-        }
-        if page_warnings
-            .iter()
-            .any(|warning| should_use_raster_fallback(warning.message()))
-        {
-            requires_raster_fallback = true;
-        }
-        warnings.extend(dedupe_warnings(page_warnings));
     }
 
-    if requires_raster_fallback {
-        if let Some(document) = convert_pdf_with_pdfkit(input_pdf, &pdfkit_render_pages)? {
-            return Ok(document);
+    if !pdfkit_render_pages.is_empty() {
+        let recovered_pages = convert_pdf_pages_with_pdfkit(input_pdf, &pdfkit_render_pages)?;
+        for page in &mut pages {
+            if page.fragment.is_some() || !pdfkit_render_pages.contains(&page.number) {
+                continue;
+            }
+
+            if let Some(fragment) = recovered_pages
+                .as_ref()
+                .and_then(|recovered| recovered.get(&page.number))
+                .cloned()
+            {
+                page.fragment = Some(fragment);
+            } else {
+                raster_fallback_pages.insert(page.number);
+            }
         }
-        return rasterize_pdf_to_typst(input_pdf);
+    }
+
+    if !raster_fallback_pages.is_empty() {
+        let mut rasterized_pages = rasterize_pdf_pages(input_pdf, &raster_fallback_pages)?;
+        for page in &mut pages {
+            if page.fragment.is_some() || !raster_fallback_pages.contains(&page.number) {
+                continue;
+            }
+
+            page.fragment = Some(rasterized_pages.remove(&page.number).ok_or_else(|| {
+                CliFailure::fatal(format!(
+                    "error: failed to rasterize PDF page {} during fallback",
+                    page.number
+                ))
+            })?);
+        }
+    }
+
+    let mut blocks = Vec::new();
+    let mut assets = Vec::new();
+    let mut previous_layout = None;
+
+    for page in pages {
+        let fragment = page.fragment.ok_or_else(|| {
+            CliFailure::fatal(format!(
+                "error: failed to convert PDF page {} into Typst output",
+                page.number
+            ))
+        })?;
+
+        if should_insert_page_break(previous_layout, fragment.layout) {
+            blocks.push("#pagebreak()".to_string());
+        }
+        assets.extend(fragment.assets);
+        blocks.extend(fragment.blocks);
+        previous_layout = Some(fragment.layout);
     }
 
     Ok(ConvertedDocument {
@@ -395,15 +462,40 @@ struct ConvertedDocument {
     warnings: Vec<Warning>,
 }
 
+#[derive(Clone)]
 struct OutputAsset {
     filename: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PageLayoutMode {
+    Flow,
+    Fixed,
+}
+
+#[derive(Clone)]
+struct PageFragment {
+    blocks: Vec<String>,
+    assets: Vec<OutputAsset>,
+    layout: PageLayoutMode,
+}
+
+struct PageAssembly {
+    number: usize,
+    fragment: Option<PageFragment>,
 }
 
 struct RasterizedPage {
     filename: String,
     width_pt: f32,
     height_pt: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageRecovery {
+    Pdfkit,
+    Raster,
 }
 
 struct PdfkitPage {
@@ -432,12 +524,42 @@ struct PositionedAsset {
     height_pt: f32,
 }
 
-fn should_use_raster_fallback(message: &str) -> bool {
-    message.contains("vector drawing commands")
+fn page_recovery_for_warning(message: &str) -> Option<PageRecovery> {
+    if message.contains("vector drawing commands")
         || message.contains("XObject invocation")
         || message.contains("inline image data")
         || message.contains("unsupported stream filter")
-        || message.contains("no digital text extracted")
+    {
+        Some(PageRecovery::Pdfkit)
+    } else if message.contains("no digital text extracted") {
+        Some(PageRecovery::Raster)
+    } else {
+        None
+    }
+}
+
+fn page_recovery_for_warnings(warnings: &[Warning]) -> Option<PageRecovery> {
+    if warnings
+        .iter()
+        .any(|warning| page_recovery_for_warning(warning.message()) == Some(PageRecovery::Pdfkit))
+    {
+        Some(PageRecovery::Pdfkit)
+    } else if warnings
+        .iter()
+        .any(|warning| page_recovery_for_warning(warning.message()) == Some(PageRecovery::Raster))
+    {
+        Some(PageRecovery::Raster)
+    } else {
+        None
+    }
+}
+
+fn should_insert_page_break(
+    previous_layout: Option<PageLayoutMode>,
+    current_layout: PageLayoutMode,
+) -> bool {
+    previous_layout.is_some_and(|layout| layout == PageLayoutMode::Fixed)
+        || current_layout == PageLayoutMode::Fixed
 }
 
 fn pdfkit_helper_paths(workspace: &Path) -> (PathBuf, PathBuf) {
@@ -447,10 +569,10 @@ fn pdfkit_helper_paths(workspace: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
-fn convert_pdf_with_pdfkit(
+fn convert_pdf_pages_with_pdfkit(
     input_pdf: &Path,
     render_pages: &HashSet<usize>,
-) -> Result<Option<ConvertedDocument>, CliFailure> {
+) -> Result<Option<HashMap<usize, PageFragment>>, CliFailure> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -467,17 +589,22 @@ fn convert_pdf_with_pdfkit(
     })?;
 
     let pages = match run_pdfkit_scene(input_pdf, &workspace, render_pages)? {
-        Some(pages) if pages.iter().any(|page| !page.lines.is_empty()) => pages,
+        Some(pages)
+            if pages
+                .iter()
+                .any(|page| render_pages.contains(&page.number) && !page.lines.is_empty()) =>
+        {
+            pages
+        }
         _ => {
             let _ = fs::remove_dir_all(&workspace);
             return Ok(None);
         }
     };
 
-    let mut assets = Vec::new();
-    let mut blocks = Vec::new();
+    let mut recovered_pages = HashMap::new();
 
-    for page in &pages {
+    for page in pages.iter().filter(|page| render_pages.contains(&page.number)) {
         let positioned_assets = match detect_non_text_regions(page, &workspace)? {
             Some(assets_for_page) => assets_for_page,
             None => {
@@ -486,6 +613,8 @@ fn convert_pdf_with_pdfkit(
             }
         };
 
+        let mut assets = Vec::new();
+        let mut blocks = Vec::new();
         blocks.push(format!(
             "#set page(width: {}, height: {}, margin: 0pt)",
             format_pt(page.width_pt),
@@ -510,18 +639,19 @@ fn convert_pdf_with_pdfkit(
             blocks.push(render_positioned_line(page, line));
         }
 
-        if page.number < pages.len() {
-            blocks.push("#pagebreak()".to_string());
-        }
+        recovered_pages.insert(
+            page.number,
+            PageFragment {
+                blocks,
+                assets,
+                layout: PageLayoutMode::Fixed,
+            },
+        );
     }
 
     let _ = fs::remove_dir_all(&workspace);
 
-    Ok(Some(ConvertedDocument {
-        typst: render_document_blocks(blocks),
-        assets,
-        warnings: Vec::new(),
-    }))
+    Ok(Some(recovered_pages))
 }
 
 fn run_pdfkit_scene(
@@ -794,104 +924,94 @@ fn unescape_helper_field(field: &str) -> String {
     output
 }
 
-fn rasterize_pdf_to_typst(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
+fn rasterize_pdf_pages(
+    input_pdf: &Path,
+    page_numbers: &BTreeSet<usize>,
+) -> Result<HashMap<usize, PageFragment>, CliFailure> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let temp_dir = env::temp_dir().join(format!(
-        "pdf-to-typst-render-{}-{timestamp}",
+        "pdf-to-typst-page-render-{}-{timestamp}",
         std::process::id()
     ));
     fs::create_dir_all(&temp_dir).map_err(|error| {
         CliFailure::fatal(format!(
-            "error: failed to prepare raster fallback workspace {}: {error}",
+            "error: failed to prepare page raster fallback workspace {}: {error}",
             temp_dir.display()
         ))
     })?;
 
-    let output_pattern = temp_dir.join("page-%04d.png");
     let ghostscript = env::var_os("PDF_TO_TYPST_GS_BIN").unwrap_or_else(|| OsString::from("gs"));
-    let output = Command::new(ghostscript)
-        .arg("-q")
-        .arg("-dSAFER")
-        .arg("-dBATCH")
-        .arg("-dNOPAUSE")
-        .arg("-sDEVICE=png16m")
-        .arg(format!("-r{RASTER_FALLBACK_DPI}"))
-        .arg("-o")
-        .arg(&output_pattern)
-        .arg(input_pdf)
-        .output()
-        .map_err(|error| {
-            CliFailure::fatal(format!(
-                "error: failed to launch Ghostscript raster fallback: {error}"
-            ))
-        })?;
+    let mut recovered_pages = HashMap::new();
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(CliFailure::fatal(if detail.is_empty() {
-            "error: Ghostscript raster fallback failed".to_string()
-        } else {
-            format!("error: Ghostscript raster fallback failed: {detail}")
-        }));
-    }
+    for page_number in page_numbers {
+        let output_path = temp_dir.join(format!("page-{page_number:04}.png"));
+        let output = Command::new(&ghostscript)
+            .arg("-q")
+            .arg("-dSAFER")
+            .arg("-dBATCH")
+            .arg("-dNOPAUSE")
+            .arg("-sDEVICE=png16m")
+            .arg(format!("-r{RASTER_FALLBACK_DPI}"))
+            .arg(format!("-dFirstPage={page_number}"))
+            .arg(format!("-dLastPage={page_number}"))
+            .arg("-o")
+            .arg(&output_path)
+            .arg(input_pdf)
+            .output()
+            .map_err(|error| {
+                CliFailure::fatal(format!(
+                    "error: failed to launch Ghostscript raster fallback: {error}"
+                ))
+            })?;
 
-    let mut page_paths = fs::read_dir(&temp_dir)
-        .map_err(|error| {
-            CliFailure::fatal(format!(
-                "error: failed to inspect raster fallback output {}: {error}",
-                temp_dir.display()
-            ))
-        })?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|extension| extension == "png"))
-        .collect::<Vec<_>>();
-    page_paths.sort();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim();
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Err(CliFailure::fatal(if detail.is_empty() {
+                format!("error: Ghostscript raster fallback failed for page {page_number}")
+            } else {
+                format!(
+                    "error: Ghostscript raster fallback failed for page {page_number}: {detail}"
+                )
+            }));
+        }
 
-    if page_paths.is_empty() {
-        return Err(CliFailure::fatal(
-            "error: Ghostscript raster fallback produced no pages",
-        ));
-    }
-
-    let mut assets = Vec::with_capacity(page_paths.len());
-    let mut pages = Vec::with_capacity(page_paths.len());
-
-    for (index, page_path) in page_paths.iter().enumerate() {
-        let bytes = fs::read(page_path).map_err(|error| {
+        let bytes = fs::read(&output_path).map_err(|error| {
             CliFailure::fatal(format!(
                 "error: failed to read rasterized page {}: {error}",
-                page_path.display()
+                output_path.display()
             ))
         })?;
         let (width_px, height_px) = parse_png_dimensions(&bytes).map_err(|message| {
             CliFailure::fatal(format!(
                 "error: failed to inspect rasterized page {}: {message}",
-                page_path.display()
+                output_path.display()
             ))
         })?;
-        let filename = format!("page-{:04}.png", index + 1);
-        assets.push(OutputAsset {
+        let filename = format!("page-{page_number:04}.png");
+        let rasterized = RasterizedPage {
             filename: filename.clone(),
-            bytes,
-        });
-        pages.push(RasterizedPage {
-            filename,
             width_pt: width_px as f32 * 72.0 / RASTER_FALLBACK_DPI as f32,
             height_pt: height_px as f32 * 72.0 / RASTER_FALLBACK_DPI as f32,
-        });
+        };
+
+        recovered_pages.insert(
+            *page_number,
+            PageFragment {
+                blocks: render_raster_page_blocks(&rasterized),
+                assets: vec![OutputAsset { filename, bytes }],
+                layout: PageLayoutMode::Fixed,
+            },
+        );
     }
 
     let _ = fs::remove_dir_all(&temp_dir);
 
-    Ok(ConvertedDocument {
-        typst: render_raster_document(&pages),
-        assets,
-        warnings: Vec::new(),
-    })
+    Ok(recovered_pages)
 }
 
 fn parse_png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
@@ -910,27 +1030,16 @@ fn parse_png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
     Ok((width, height))
 }
 
-fn render_raster_document(pages: &[RasterizedPage]) -> String {
-    let mut blocks = Vec::with_capacity(pages.len() * 3);
-
-    for (index, page) in pages.iter().enumerate() {
-        let width = format_pt(page.width_pt);
-        let height = format_pt(page.height_pt);
-        blocks.push(format!(
-            "#set page(width: {width}, height: {height}, margin: 0pt)"
-        ));
-        blocks.push(format!(
+fn render_raster_page_blocks(page: &RasterizedPage) -> Vec<String> {
+    let width = format_pt(page.width_pt);
+    let height = format_pt(page.height_pt);
+    vec![
+        format!("#set page(width: {width}, height: {height}, margin: 0pt)"),
+        format!(
             "#image(\"assets/{}\", width: {width}, height: {height})",
             page.filename
-        ));
-        if index + 1 < pages.len() {
-            blocks.push("#pagebreak()".to_string());
-        }
-    }
-
-    let mut output = blocks.join("\n\n");
-    output.push('\n');
-    output
+        ),
+    ]
 }
 
 fn format_pt(value: f32) -> String {
@@ -3634,30 +3743,35 @@ fn max_backtick_run(input: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{pdfkit_helper_paths, should_use_raster_fallback};
+    use super::{page_recovery_for_warning, pdfkit_helper_paths, PageRecovery};
     use std::path::Path;
 
     #[test]
-    fn xobject_warnings_trigger_raster_recovery() {
-        assert!(should_use_raster_fallback(
-            "unsupported content on page 1: XObject invocation"
-        ));
+    fn xobject_warnings_trigger_pdfkit_recovery() {
+        assert_eq!(
+            page_recovery_for_warning("unsupported content on page 1: XObject invocation"),
+            Some(PageRecovery::Pdfkit)
+        );
     }
 
     #[test]
-    fn unrecoverable_content_still_forces_raster_fallback() {
-        assert!(should_use_raster_fallback(
-            "unsupported content on page 1: vector drawing commands"
-        ));
-        assert!(should_use_raster_fallback(
-            "unsupported content on page 1: inline image data"
-        ));
-        assert!(should_use_raster_fallback(
-            "unsupported content on page 1: unsupported stream filter"
-        ));
-        assert!(should_use_raster_fallback(
-            "unsupported content on page 1: no digital text extracted"
-        ));
+    fn warning_classification_distinguishes_pdfkit_and_raster_recovery() {
+        assert_eq!(
+            page_recovery_for_warning("unsupported content on page 1: vector drawing commands"),
+            Some(PageRecovery::Pdfkit)
+        );
+        assert_eq!(
+            page_recovery_for_warning("unsupported content on page 1: inline image data"),
+            Some(PageRecovery::Pdfkit)
+        );
+        assert_eq!(
+            page_recovery_for_warning("unsupported content on page 1: unsupported stream filter"),
+            Some(PageRecovery::Pdfkit)
+        );
+        assert_eq!(
+            page_recovery_for_warning("unsupported content on page 1: no digital text extracted"),
+            Some(PageRecovery::Raster)
+        );
     }
 
     #[test]
