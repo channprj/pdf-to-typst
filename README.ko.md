@@ -20,15 +20,17 @@
 ### macOS (Homebrew)
 
 ```sh
-brew tap channprj/tap
-brew install pdf-to-typst
+brew install channprj/tap/pdf-to-typst
 ```
 
-> **참고:** Homebrew tap은 첫 릴리스(v0.1.0) 이후 사용 가능합니다.
+> **참고:** 현재 tap은 macOS에서 소스 빌드로 설치되며, helper script는
+> Homebrew의 `lib/pdf-to-typst/tools` 경로에 배치됩니다.
 
 ### GitHub Releases에서 다운로드
 
-[Releases](https://github.com/channprj/pdf-to-typst/releases) 페이지에서 미리 빌드된 바이너리를 다운로드하세요.
+[Releases](https://github.com/channprj/pdf-to-typst/releases)에는 아직 태그된 릴리스
+아카이브가 없습니다. 첫 tagged release가 배포되면 다음 대상의 미리 빌드된 바이너리를
+여기에서 받을 수 있습니다.
 
 | 플랫폼 | Target |
 |--------|--------|

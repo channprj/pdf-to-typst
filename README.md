@@ -20,15 +20,17 @@
 ### macOS (Homebrew)
 
 ```sh
-brew tap channprj/tap
-brew install pdf-to-typst
+brew install channprj/tap/pdf-to-typst
 ```
 
-> **Note:** The Homebrew tap will be available after the first release (v0.1.0).
+> **Note:** The current tap installs from source on macOS and places helper
+> scripts under Homebrew's `lib/pdf-to-typst/tools` path.
 
 ### GitHub Releases
 
-Download a pre-built binary from [Releases](https://github.com/channprj/pdf-to-typst/releases). Available targets:
+Tagged GitHub release archives are not published yet. Once the first tagged
+release is cut, pre-built binaries will be listed on
+[Releases](https://github.com/channprj/pdf-to-typst/releases) for:
 
 | Platform | Target |
 |----------|--------|
