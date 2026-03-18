@@ -23,6 +23,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: typst-community/setup-typst@v4
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -30,7 +32,7 @@ jobs:
         run: cargo clippy -- -D warnings
 
       - name: Install runtime dependencies
-        run: brew install ghostscript tesseract typst
+        run: brew install ghostscript tesseract imagemagick
 
       - name: Build
         run: cargo build
@@ -51,6 +53,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: typst-community/setup-typst@v4
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -58,7 +62,7 @@ jobs:
         run: cargo clippy -- -D warnings
 
       - name: Install runtime dependencies
-        run: sudo apt-get update && sudo apt-get install -y ghostscript tesseract-ocr
+        run: sudo apt-get update && sudo apt-get install -y ghostscript tesseract-ocr imagemagick
 
       - name: Build
         run: cargo build
