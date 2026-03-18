@@ -70,6 +70,14 @@ fn assert_positioned_text_output(output_dir: &Path, expected_text: &str) {
     assert!(!main_typ.contains("#image(\"assets/page-0001.png\""));
 }
 
+fn assert_recovered_layout_output(output_dir: &Path, expected_text: &str) {
+    if cfg!(target_os = "macos") {
+        assert_positioned_text_output(output_dir, expected_text);
+    } else {
+        assert_rasterized_page_output(output_dir);
+    }
+}
+
 fn make_executable(path: &Path) {
     let mut permissions = fs::metadata(path)
         .expect("file metadata should exist")
@@ -990,7 +998,7 @@ fn unsupported_non_text_content_keeps_real_text_layout() {
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    assert_positioned_text_output(&output_dir, "Text survives unsupported content.");
+    assert_recovered_layout_output(&output_dir, "Text survives unsupported content.");
 }
 
 #[test]
@@ -1509,7 +1517,7 @@ fn default_mode_preserves_output_when_conversion_reports_multiple_diagnostics() 
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    assert_positioned_text_output(&output_dir, "Best-effort mode should keep readable text.");
+    assert_recovered_layout_output(&output_dir, "Best-effort mode should keep readable text.");
 }
 
 #[test]
@@ -1562,7 +1570,7 @@ fn strict_mode_accepts_text_layout_recovery_for_multiple_diagnostics() {
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    assert_positioned_text_output(
+    assert_recovered_layout_output(
         &output_dir,
         "Strict mode should reject incomplete conversion.",
     );

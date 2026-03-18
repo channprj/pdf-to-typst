@@ -440,6 +440,13 @@ fn should_use_raster_fallback(message: &str) -> bool {
         || message.contains("no digital text extracted")
 }
 
+fn pdfkit_helper_paths(workspace: &Path) -> (PathBuf, PathBuf) {
+    (
+        workspace.join("pdfkit-scene"),
+        workspace.join("swift-module-cache"),
+    )
+}
+
 fn convert_pdf_with_pdfkit(
     input_pdf: &Path,
     render_pages: &HashSet<usize>,
@@ -523,8 +530,7 @@ fn run_pdfkit_scene(
     render_pages: &HashSet<usize>,
 ) -> Result<Option<Vec<PdfkitPage>>, CliFailure> {
     let helper_source = tools_dir().join("pdfkit_scene.swift");
-    let helper_binary = env::temp_dir().join("pdf-to-typst-pdfkit-scene");
-    let module_cache = env::temp_dir().join("swift-module-cache");
+    let (helper_binary, module_cache) = pdfkit_helper_paths(workspace);
     let render_dir = workspace.join("renders");
     fs::create_dir_all(&render_dir).map_err(|error| {
         CliFailure::fatal(format!(
@@ -3624,4 +3630,49 @@ fn max_backtick_run(input: &str) -> usize {
     }
 
     max_run
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pdfkit_helper_paths, should_use_raster_fallback};
+    use std::path::Path;
+
+    #[test]
+    fn xobject_warnings_trigger_raster_recovery() {
+        assert!(should_use_raster_fallback(
+            "unsupported content on page 1: XObject invocation"
+        ));
+    }
+
+    #[test]
+    fn unrecoverable_content_still_forces_raster_fallback() {
+        assert!(should_use_raster_fallback(
+            "unsupported content on page 1: vector drawing commands"
+        ));
+        assert!(should_use_raster_fallback(
+            "unsupported content on page 1: inline image data"
+        ));
+        assert!(should_use_raster_fallback(
+            "unsupported content on page 1: unsupported stream filter"
+        ));
+        assert!(should_use_raster_fallback(
+            "unsupported content on page 1: no digital text extracted"
+        ));
+    }
+
+    #[test]
+    fn pdfkit_helper_paths_are_scoped_to_workspace() {
+        let workspace_a = Path::new("/tmp/pdf-to-typst-a");
+        let workspace_b = Path::new("/tmp/pdf-to-typst-b");
+
+        let (binary_a, cache_a) = pdfkit_helper_paths(workspace_a);
+        let (binary_b, cache_b) = pdfkit_helper_paths(workspace_b);
+
+        assert!(binary_a.starts_with(workspace_a));
+        assert!(cache_a.starts_with(workspace_a));
+        assert!(binary_b.starts_with(workspace_b));
+        assert!(cache_b.starts_with(workspace_b));
+        assert_ne!(binary_a, binary_b);
+        assert_ne!(cache_a, cache_b);
+    }
 }
