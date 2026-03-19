@@ -115,6 +115,7 @@ bd automatically syncs with git:
 - ✅ Always use `--json` flag for programmatic use
 - ✅ Link discovered work with `discovered-from` dependencies
 - ✅ Check `bd ready` before asking "what should I work on?"
+- ✅ Work only in the current checkout; do NOT use `git worktree`
 - ❌ Do NOT create markdown TODO lists
 - ❌ Do NOT use external issue trackers
 - ❌ Do NOT duplicate tracking systems
