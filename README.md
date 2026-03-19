@@ -28,9 +28,12 @@ brew install channprj/tap/pdf-to-typst
 
 ### GitHub Releases
 
-Tagged GitHub release archives are not published yet. Once the first tagged
-release is cut, pre-built binaries will be listed on
-[Releases](https://github.com/channprj/pdf-to-typst/releases) for:
+Pre-built archives are published on
+[Releases](https://github.com/channprj/pdf-to-typst/releases) whenever a commit
+landed on `main` includes the word `release` in its commit message, or when the
+release workflow is triggered manually. Release tags use the format
+`v{major}.{YYMMDD}.{RUN_ID}`, for example `v0.260319.123456789`, where
+`RUN_ID` is `github.run_id`. Archives are published for:
 
 | Platform | Target |
 |----------|--------|

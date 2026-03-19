@@ -2,7 +2,8 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,8 +12,74 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.meta.outputs.run_id }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+      version_tag: ${{ steps.meta.outputs.version_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: meta
+        name: Compute version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "error: releases may only be published from main; current ref is ${GITHUB_REF}" >&2
+            exit 1
+          fi
+
+          MAJOR="$(grep '^version = ' Cargo.toml | head -n1 | cut -d'"' -f2 | cut -d'.' -f1)"
+          DATE_YYMMDD="$(TZ=Asia/Seoul date +'%y%m%d')"
+          RUN_ID="${{ github.run_id }}"
+          VERSION_TAG="v${MAJOR}.${DATE_YYMMDD}.${RUN_ID}"
+          COMMIT_MESSAGE="$(git log -1 --pretty=%B)"
+          SHOULD_RELEASE=false
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || grep -qiw 'release' <<<"${COMMIT_MESSAGE}"; then
+            SHOULD_RELEASE=true
+          fi
+
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "should_release=${SHOULD_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or verify release tag
+        if: steps.meta.outputs.should_release == 'true'
+        shell: bash
+        env:
+          VERSION_TAG: ${{ steps.meta.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+
+          git fetch --force --tags origin
+
+          if git rev-parse -q --verify "refs/tags/${VERSION_TAG}" >/dev/null; then
+            TAG_COMMIT="$(git rev-list -n1 "${VERSION_TAG}")"
+            if [[ "${TAG_COMMIT}" != "${GITHUB_SHA}" ]]; then
+              echo "error: ${VERSION_TAG} already exists for ${TAG_COMMIT}, not ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+
+            echo "Tag ${VERSION_TAG} already exists for this commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${VERSION_TAG}" -m "release: ${VERSION_TAG}"
+          git push origin "refs/tags/${VERSION_TAG}"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -25,6 +92,8 @@ jobs:
             os: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.version_tag }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.90.0
@@ -36,9 +105,11 @@ jobs:
 
       - name: Package tarball
         shell: bash
+        env:
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+          RUN_ID: ${{ needs.prepare.outputs.run_id }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          ARCHIVE="pdf-to-typst-${TAG}-${{ matrix.target }}"
+          ARCHIVE="pdf-to-typst-${VERSION_TAG}-${{ matrix.target }}"
           mkdir -p "${ARCHIVE}"
           cp "target/${{ matrix.target }}/release/pdf-to-typst" "${ARCHIVE}/"
           cp -r tools/ "${ARCHIVE}/tools/"
@@ -54,7 +125,8 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
@@ -65,5 +137,8 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          name: ${{ needs.prepare.outputs.version_tag }}
+          tag_name: ${{ needs.prepare.outputs.version_tag }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: artifacts/**/*.tar.gz

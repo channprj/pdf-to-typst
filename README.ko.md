@@ -28,9 +28,12 @@ brew install channprj/tap/pdf-to-typst
 
 ### GitHub Releases에서 다운로드
 
-[Releases](https://github.com/channprj/pdf-to-typst/releases)에는 아직 태그된 릴리스
-아카이브가 없습니다. 첫 tagged release가 배포되면 다음 대상의 미리 빌드된 바이너리를
-여기에서 받을 수 있습니다.
+[Releases](https://github.com/channprj/pdf-to-typst/releases)에는 `main`에
+머지된 커밋 메시지에 `release`가 포함되거나, 릴리즈 워크플로를 수동 실행했을 때
+미리 빌드된 아카이브가 올라갑니다. 릴리즈 태그 형식은
+`v{major}.{YYMMDD}.{RUN_ID}`이며, 예시는 `v0.260319.123456789`입니다.
+여기서 `RUN_ID`는 `github.run_id`를 사용합니다. 다음 대상의 바이너리가
+게시됩니다.
 
 | 플랫폼 | Target |
 |--------|--------|
