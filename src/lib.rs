@@ -633,7 +633,10 @@ fn convert_pdf_pages_with_pdfkit(
 
     let mut recovered_pages = HashMap::new();
 
-    for page in pages.iter().filter(|page| render_pages.contains(&page.number)) {
+    for page in pages
+        .iter()
+        .filter(|page| render_pages.contains(&page.number))
+    {
         let positioned_assets = match detect_non_text_regions(page, &workspace)? {
             Some(assets_for_page) => assets_for_page,
             None => {
@@ -2593,9 +2596,8 @@ impl OcrEngine {
 }
 
 fn write_temp_ocr_image(candidate: &OcrImageCandidate) -> Result<PathBuf, String> {
-    let workspace = ocr_temp_workspace().map_err(|error| {
-        format!("failed to prepare OCR workspace: {error}")
-    })?;
+    let workspace = ocr_temp_workspace()
+        .map_err(|error| format!("failed to prepare OCR workspace: {error}"))?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
@@ -3875,7 +3877,7 @@ fn max_backtick_run(input: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{page_recovery_for_warning, pdfkit_helper_paths, PageRecovery};
+    use super::{PageRecovery, page_recovery_for_warning, pdfkit_helper_paths};
     use std::path::Path;
 
     #[test]
