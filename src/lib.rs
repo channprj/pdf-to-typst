@@ -302,6 +302,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
         let mut page_warnings = Vec::new();
         let mut page_xobjects = Vec::new();
         let mut ocr_attempted = false;
+        let mut rendered_ocr_page = None;
 
         for content_ref in content_refs {
             match pdf.decode_content_stream(content_ref) {
@@ -332,7 +333,15 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
                     "OCR unavailable on page {page_number}: embedded image encoding is unsupported; scanned page content could not be extracted"
                 )));
             } else {
-                let ocr_result = ocr_engine.ocr_page(page_number, &page_images.candidates);
+                rendered_ocr_page = render_page_png_for_ocr(input_pdf, page_number);
+                let rendered_candidates;
+                let ocr_candidates = if let Some(rendered) = rendered_ocr_page.as_ref() {
+                    rendered_candidates = vec![rendered.candidate.clone()];
+                    rendered_candidates.as_slice()
+                } else {
+                    page_images.candidates.as_slice()
+                };
+                let ocr_result = ocr_engine.ocr_page(page_number, ocr_candidates);
                 page_lines.extend(ocr_result.lines);
                 page_warnings.extend(ocr_result.warnings);
             }
@@ -343,9 +352,22 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
 
         if ocr_attempted {
             if page_lines.is_empty() {
-                page_warnings.push(Warning::new(format!(
-                    "unsupported content on page {page_number}: no digital text extracted"
-                )));
+                if let Some(rendered) = rendered_ocr_page.as_ref() {
+                    if rendered.is_blank {
+                        page_fragment = Some(render_blank_page_fragment(
+                            rendered.width_pt,
+                            rendered.height_pt,
+                        ));
+                    } else {
+                        page_warnings.push(Warning::new(format!(
+                            "unsupported content on page {page_number}: no digital text extracted"
+                        )));
+                    }
+                } else {
+                    page_warnings.push(Warning::new(format!(
+                        "unsupported content on page {page_number}: no digital text extracted"
+                    )));
+                }
             } else {
                 page_fragment = Some(PageFragment {
                     blocks: render_text_blocks(page_lines),
@@ -490,6 +512,13 @@ struct RasterizedPage {
     filename: String,
     width_pt: f32,
     height_pt: f32,
+}
+
+struct RenderedOcrPage {
+    candidate: OcrImageCandidate,
+    width_pt: f32,
+    height_pt: f32,
+    is_blank: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1012,6 +1041,88 @@ fn rasterize_pdf_pages(
     let _ = fs::remove_dir_all(&temp_dir);
 
     Ok(recovered_pages)
+}
+
+fn render_page_png_for_ocr(input_pdf: &Path, page_number: usize) -> Option<RenderedOcrPage> {
+    let workspace = ocr_temp_workspace().ok()?;
+    let path = workspace.join(format!(
+        "pdf-to-typst-ocr-page-{}-{page_number}.png",
+        std::process::id()
+    ));
+    let ghostscript = env::var_os("PDF_TO_TYPST_GS_BIN").unwrap_or_else(|| OsString::from("gs"));
+    let output = Command::new(&ghostscript)
+        .arg("-q")
+        .arg("-dSAFER")
+        .arg("-dBATCH")
+        .arg("-dNOPAUSE")
+        .arg("-sDEVICE=pnggray")
+        .arg("-r300")
+        .arg(format!("-dFirstPage={page_number}"))
+        .arg(format!("-dLastPage={page_number}"))
+        .arg("-o")
+        .arg(&path)
+        .arg(input_pdf)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        cleanup_temp_ocr_image(&path);
+        return None;
+    }
+
+    let bytes = fs::read(&path).ok()?;
+    let (width, height) = parse_png_dimensions(&bytes).ok()?;
+    let is_blank = detect_blank_rendered_page(&path).unwrap_or(false);
+    cleanup_temp_ocr_image(&path);
+
+    Some(RenderedOcrPage {
+        candidate: OcrImageCandidate {
+            width: width as usize,
+            height: height as usize,
+            extension: "png",
+            bytes,
+        },
+        width_pt: width as f32 * 72.0 / 300.0,
+        height_pt: height as f32 * 72.0 / 300.0,
+        is_blank,
+    })
+}
+
+fn detect_blank_rendered_page(path: &Path) -> Option<bool> {
+    let output = Command::new("magick")
+        .arg(path)
+        .arg("-colorspace")
+        .arg("gray")
+        .arg("-threshold")
+        .arg("95%")
+        .arg("-negate")
+        .arg("-format")
+        .arg("%[fx:mean]")
+        .arg("info:")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let mean = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f32>()
+        .ok()?;
+    Some(mean <= 0.01)
+}
+
+fn render_blank_page_fragment(width_pt: f32, height_pt: f32) -> PageFragment {
+    PageFragment {
+        blocks: vec![format!(
+            "#set page(width: {}, height: {}, margin: 0pt)",
+            format_pt(width_pt),
+            format_pt(height_pt)
+        )],
+        assets: Vec::new(),
+        layout: PageLayoutMode::Fixed,
+    }
 }
 
 fn parse_png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
@@ -2354,7 +2465,7 @@ impl OcrEngine {
             .arg("6")
             .arg("tsv")
             .output();
-        let _ = fs::remove_file(&temp_path);
+        cleanup_temp_ocr_image(&temp_path);
 
         let output = match output {
             Ok(output) => output,
@@ -2482,11 +2593,14 @@ impl OcrEngine {
 }
 
 fn write_temp_ocr_image(candidate: &OcrImageCandidate) -> Result<PathBuf, String> {
+    let workspace = ocr_temp_workspace().map_err(|error| {
+        format!("failed to prepare OCR workspace: {error}")
+    })?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_nanos();
-    let path = env::temp_dir().join(format!(
+    let path = workspace.join(format!(
         "pdf-to-typst-ocr-{}-{timestamp}.{}",
         std::process::id(),
         candidate.extension
@@ -2500,6 +2614,24 @@ fn write_temp_ocr_image(candidate: &OcrImageCandidate) -> Result<PathBuf, String
     })?;
 
     Ok(path)
+}
+
+fn ocr_temp_workspace() -> std::io::Result<PathBuf> {
+    let preferred = env::current_dir()?.join(".pdf-to-typst-ocr-tmp");
+    fs::create_dir_all(&preferred)?;
+    Ok(preferred)
+}
+
+fn cleanup_temp_ocr_image(path: &Path) {
+    let _ = fs::remove_file(path);
+    if let Some(parent) = path.parent()
+        && parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == ".pdf-to-typst-ocr-tmp")
+    {
+        let _ = fs::remove_dir(parent);
+    }
 }
 
 fn parse_tesseract_languages(stdout: &[u8]) -> HashSet<String> {

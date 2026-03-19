@@ -197,6 +197,109 @@ fi
     fake_tesseract
 }
 
+fn install_accessible_path_ocr_stub(output_root: &Path) -> PathBuf {
+    let fake_tesseract = output_root.join("fake-tesseract-accessible-path.sh");
+
+    write_script(
+        &fake_tesseract,
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "--list-langs" ]; then
+  printf 'List of available languages in "/tmp/tessdata/" (2):\neng\nkor\n'
+  exit 0
+fi
+case "${1:-}" in
+  /tmp/*|/var/folders/*)
+    echo "ocr input path is not accessible enough: $1" >&2
+    exit 9
+    ;;
+esac
+cat <<'EOF'
+level	page_num	block_num	par_num	line_num	word_num	left	top	width	height	conf	text
+1	1	0	0	0	0	0	0	1000	1400	-1	
+2	1	1	0	0	0	60	80	620	290	-1	
+3	1	1	1	0	0	60	80	620	290	-1	
+4	1	1	1	1	0	60	80	420	42	-1	
+5	1	1	1	1	1	60	80	150	42	96	회의록
+5	1	1	1	1	2	224	80	108	42	94	Meeting
+5	1	1	1	1	3	344	80	180	42	94	Notes
+EOF
+"#,
+    );
+
+    fake_tesseract
+}
+
+fn install_png_only_ocr_stub(output_root: &Path) -> PathBuf {
+    let fake_tesseract = output_root.join("fake-tesseract-png-only.sh");
+
+    write_script(
+        &fake_tesseract,
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "--list-langs" ]; then
+  printf 'List of available languages in "/tmp/tessdata/" (2):\neng\nkor\n'
+  exit 0
+fi
+case "${1:-}" in
+  *.png) ;;
+  *)
+    echo "expected rendered PNG OCR input, got: $1" >&2
+    exit 9
+    ;;
+esac
+cat <<'EOF'
+level	page_num	block_num	par_num	line_num	word_num	left	top	width	height	conf	text
+1	1	0	0	0	0	0	0	1000	1400	-1	
+2	1	1	0	0	0	60	80	620	290	-1	
+3	1	1	1	0	0	60	80	620	290	-1	
+4	1	1	1	1	0	60	80	420	42	-1	
+5	1	1	1	1	1	60	80	150	42	96	회의록
+5	1	1	1	1	2	224	80	108	42	94	Meeting
+5	1	1	1	1	3	344	80	180	42	94	Notes
+4	1	1	1	2	0	60	136	520	18	-1	
+5	1	1	1	2	1	60	136	118	18	93	스캔된
+5	1	1	1	2	2	190	136	162	18	92	문서입니다.
+4	1	1	1	3	0	60	162	650	18	-1	
+5	1	1	1	3	1	60	162	86	18	92	English
+5	1	1	1	3	2	158	162	58	18	91	text
+5	1	1	1	3	3	228	162	66	18	91	joins
+5	1	1	1	3	4	306	162	54	18	90	same
+5	1	1	1	3	5	372	162	132	18	90	paragraph.
+EOF
+"#,
+    );
+
+    fake_tesseract
+}
+
+fn install_png_only_empty_ocr_stub(output_root: &Path) -> PathBuf {
+    let fake_tesseract = output_root.join("fake-tesseract-png-empty.sh");
+
+    write_script(
+        &fake_tesseract,
+        r#"#!/bin/sh
+set -eu
+if [ "${1:-}" = "--list-langs" ]; then
+  printf 'List of available languages in "/tmp/tessdata/" (2):\neng\nkor\n'
+  exit 0
+fi
+case "${1:-}" in
+  *.png) ;;
+  *)
+    echo "expected rendered PNG OCR input, got: $1" >&2
+    exit 9
+    ;;
+esac
+cat <<'EOF'
+level	page_num	block_num	par_num	line_num	word_num	left	top	width	height	conf	text
+EOF
+"#,
+    );
+
+    fake_tesseract
+}
+
 fn fail_sample(sample: &str, stage: &str, detail: impl AsRef<str>) -> ! {
     panic!(
         "sample {sample} regressed during {stage}: {}",
@@ -1312,6 +1415,40 @@ EOF
 }
 
 #[test]
+fn scanned_pdf_writes_ocr_input_to_tesseract_readable_path() {
+    let output_root = test_path("ocr-accessible-path");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let fake_tesseract = install_accessible_path_ocr_stub(&output_root);
+    let page = ScannedPageSpec {
+        width: 8,
+        height: 8,
+        pixels: &[255; 64],
+        draw_x: 72.0,
+        draw_y: 540.0,
+        draw_width: 468.0,
+        draw_height: 180.0,
+    };
+
+    create_dir(&output_root);
+    write_file(&input, &build_scanned_pdf(&[page]));
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(read_to_string(&output_dir.join("main.typ")).contains("회의록 Meeting Notes"));
+}
+
+#[test]
 fn scanned_pdf_keeps_successful_ocr_pages_when_later_page_needs_raster_fallback() {
     let output_root = test_path("ocr-partial-fallback");
     let input = output_root.join("input.pdf");
@@ -1329,7 +1466,7 @@ fn scanned_pdf_keeps_successful_ocr_pages_when_later_page_needs_raster_fallback(
     let second_page = ScannedPageSpec {
         width: 8,
         height: 8,
-        pixels: &[255; 64],
+        pixels: &[0; 64],
         draw_x: 72.0,
         draw_y: 540.0,
         draw_width: 468.0,
@@ -1354,6 +1491,67 @@ fn scanned_pdf_keeps_successful_ocr_pages_when_later_page_needs_raster_fallback(
     assert!(main_typ.contains("#image(\"assets/page-0002.png\""));
     assert!(!main_typ.contains("#image(\"assets/page-0001.png\""));
     assert!(output_dir.join("assets").join("page-0002.png").is_file());
+}
+
+#[test]
+fn blank_scanned_page_becomes_blank_page_instead_of_full_image() {
+    let output_root = test_path("blank-scanned-page");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let fake_tesseract = install_png_only_empty_ocr_stub(&output_root);
+    let page = ScannedPageSpec {
+        width: 8,
+        height: 8,
+        pixels: &[255; 64],
+        draw_x: 72.0,
+        draw_y: 540.0,
+        draw_width: 468.0,
+        draw_height: 180.0,
+    };
+
+    create_dir(&output_root);
+    write_file(&input, &build_scanned_pdf(&[page]));
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(output.status.success());
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("#set page(width: "));
+    assert!(!main_typ.contains("#image(\"assets/page-0001.png\""));
+    assert!(!output_dir.join("assets").join("page-0001.png").exists());
+}
+
+#[test]
+fn sample_pdf_uses_rendered_png_for_ccitt_ocr_input() {
+    let output_root = test_path("sample-png-ocr");
+    let output_dir = output_root.join("out");
+    let fake_tesseract = install_png_only_ocr_stub(&output_root);
+
+    create_dir(&output_root);
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg("data/sample-00.pdf")
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("회의록 Meeting Notes"));
+    assert!(main_typ.contains("English text joins same paragraph."));
+    assert!(!main_typ.contains("#image(\"assets/page-0001.png\""));
 }
 
 #[test]
