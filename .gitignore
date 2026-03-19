@@ -5,9 +5,9 @@ target
 .worktrees/
 .ralph-tui/
 output/
+data/
 
 
 # Dolt database files (added by bd init)
 .dolt/
 *.db
-

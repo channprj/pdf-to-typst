@@ -506,6 +506,10 @@ fn extract_image_paths(block: &str) -> Vec<&str> {
     paths
 }
 
+fn local_sample_pdfs_available(paths: &[&str]) -> bool {
+    paths.iter().all(|path| Path::new(path).is_file())
+}
+
 fn run_sample_regression(case: &SampleRegressionCase<'_>) {
     let output_root = test_path(case.name);
     let output_dir = output_root.join("out");
@@ -1528,7 +1532,12 @@ fn blank_scanned_page_becomes_blank_page_instead_of_full_image() {
 }
 
 #[test]
+#[ignore = "requires local data/sample-00.pdf"]
 fn sample_pdf_uses_rendered_png_for_ccitt_ocr_input() {
+    if !local_sample_pdfs_available(&["data/sample-00.pdf"]) {
+        return;
+    }
+
     let output_root = test_path("sample-png-ocr");
     let output_dir = output_root.join("out");
     let fake_tesseract = install_png_only_ocr_stub(&output_root);
@@ -1873,7 +1882,16 @@ fn strict_mode_accepts_text_layout_recovery_for_multiple_diagnostics() {
 }
 
 #[test]
+#[ignore = "requires local data/sample-*.pdf fixtures"]
 fn sample_pdfs_regress_to_valid_typst_outputs() {
+    if !local_sample_pdfs_available(&[
+        "data/sample-00.pdf",
+        "data/sample-01.pdf",
+        "data/sample-02.pdf",
+    ]) {
+        return;
+    }
+
     let cases = [
         SampleRegressionCase {
             name: "sample-00",

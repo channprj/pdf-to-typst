@@ -65,12 +65,12 @@ UI/browser verification is not applicable for this CLI PRD.
 - [ ] 동일한 실패 사례에 대해 기본 모드와 `--strict` 모드의 차이가 테스트로 검증된다.
 
 ### US-006: Validate compileability and regression coverage
-**Description:** As a developer, I want automated regression checks on sample PDFs so that converted Typst output stays compileable as the converter evolves.
+**Description:** As a developer, I want local regression checks on sample PDFs so that converted Typst output stays compileable as the converter evolves without requiring tracked large fixtures in the repository.
 
 **Acceptance Criteria:**
-- [ ] 저장소의 `data/` 샘플 PDF들을 자동 테스트에 사용할 수 있다.
-- [ ] `cargo test` 안에서 지원 대상 샘플의 생성 `.typ`가 실제로 컴파일 가능한지 검증한다.
-- [ ] 회귀 테스트는 최소 1개의 디지털 PDF와 1개의 스캔 한국어/영어 혼합 PDF를 포함한다.
+- [ ] 로컬에만 보관하는 `data/` 샘플 PDF들로 수동 회귀 검증을 실행할 수 있다.
+- [ ] 기본 `cargo test`는 저장소에 샘플 PDF가 없어도 통과한다.
+- [ ] 수동 회귀 검증은 최소 1개의 디지털 PDF와 1개의 스캔 한국어/영어 혼합 PDF를 포함한다.
 - [ ] 테스트 실패 시 어떤 샘플과 어떤 변환 단계가 깨졌는지 식별 가능하다.
 
 ## Functional Requirements
@@ -83,13 +83,13 @@ UI/browser verification is not applicable for this CLI PRD.
 7. FR-7: 시스템은 지원 불가 요소를 만났을 때 경고 기반 계속 진행과 `--strict` 실패 모드를 모두 제공해야 한다.
 8. FR-8: 시스템은 경고 또는 실패 사유를 사용자에게 이해 가능한 진단 형태로 출력해야 한다.
 9. FR-9: 시스템은 지원 대상 입력에 대해 컴파일 가능한 Typst 결과물을 생성해야 한다.
-10. FR-10: 시스템은 `data/` 기반 회귀 테스트를 통해 변환 품질과 컴파일 가능성을 검증해야 한다.
+10. FR-10: 시스템은 로컬 `data/` 기반 수동 회귀 검증으로 변환 품질과 컴파일 가능성을 확인할 수 있어야 한다.
 
 ## Non-Goals
 이번 라운드에서는 명시적 비목표를 두지 않는다. 스캔/OCR 지원, 표/이미지/캡션 보존, 엄격 모드 모두 MVP 범위에 포함한다.
 
 ## Technical Considerations
-- 현재 저장소에는 `data/` 샘플 PDF만 존재하므로, 구현 단계에서 Rust CLI 프로젝트 구조와 테스트 하네스를 함께 정리해야 할 가능성이 높다.
+- 샘플 PDF는 저장소에 커밋하지 않고 로컬 `data/` 디렉터리에만 유지해야 한다.
 - OCR 엔진은 한국어/영어 혼합 문서를 안정적으로 다룰 수 있어야 하며, 로컬과 CI에서 재현 가능해야 한다.
 - 변환 파이프라인은 PDF 추출/OCR, 문서 구조 복원, Typst 출력 단계를 분리하는 편이 유지보수에 유리하다.
 - Typst 컴파일 검증을 자동화하려면 테스트 환경에서 Typst 실행 가능성을 확보해야 한다.
@@ -97,13 +97,13 @@ UI/browser verification is not applicable for this CLI PRD.
 
 ## Success Metrics
 - 지원 대상 샘플 PDF의 100%가 주 `.typ` 파일 생성까지 완료된다.
-- 지원 대상 샘플 PDF의 100%가 자동 테스트에서 Typst 컴파일에 성공한다.
+- 로컬 수동 회귀 검증 대상 샘플 PDF의 100%가 Typst 컴파일에 성공한다.
 - 지원 불가 요소에 대한 무음 누락이 0건이어야 하며, 모든 저하 변환은 경고 또는 엄격 실패로 드러난다.
-- 회귀 테스트 세트에 디지털 PDF와 스캔 한국어/영어 혼합 PDF가 모두 포함된다.
+- 로컬 회귀 검증 세트에 디지털 PDF와 스캔 한국어/영어 혼합 PDF가 모두 포함된다.
 
 ## Open Questions
 - 한국어/영어 혼합 문서에 대한 기본 OCR 엔진 또는 라이브러리는 무엇으로 할 것인가?
 - 경고는 표준 출력/표준 에러만으로 충분한가, 아니면 머신 리더블 리포트 파일도 함께 생성해야 하는가?
 - 생성되는 Typst 결과물은 어떤 기본 템플릿 또는 프로젝트 스캐폴딩을 전제로 해야 하는가?
 - 표 구조 신뢰도가 낮을 때 기본 폴백은 텍스트 선형화가 좋은가, 이미지 보존이 좋은가?
-- Typst 컴파일 검증을 로컬 개발 환경과 CI에서 어떤 방식으로 일관되게 보장할 것인가?
+- 추적되지 않는 로컬 샘플 PDF 회귀 검증을 어떤 운영 절차로 유지할 것인가?
