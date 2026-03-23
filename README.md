@@ -21,7 +21,7 @@
 
 ```sh
 brew install channprj/tap/pdf-to-typst
-brew install channprj/tap/pdf-to-typst@0.260323.1
+brew install channprj/tap/pdf-to-typst@0.260323.2
 ```
 
 > **Note:** The tap builds from the tagged source archive for each release and
@@ -33,7 +33,7 @@ Pre-built archives are published on
 [Releases](https://github.com/channprj/pdf-to-typst/releases) whenever a commit
 landed on `main` includes the word `release` in its commit message, or when the
 release workflow is triggered manually. The release version is read directly
-from the repository's `VERSION` file, for example `v0.260323.1`, and the same
+from the repository's `VERSION` file, for example `v0.260323.2`, and the same
 value is used for Git tags, GitHub Releases, `pdf-to-typst --version`, and the
 Homebrew formulas published in `channprj/tap`.
 Archives are published for:

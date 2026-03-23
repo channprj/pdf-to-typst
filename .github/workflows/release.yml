@@ -146,7 +146,7 @@ jobs:
   homebrew_tap:
     name: Update Homebrew Tap
     needs: [prepare, build]
-    if: needs.prepare.outputs.should_release == 'true'
+    if: needs.prepare.outputs.should_release == 'true' && secrets.HOMEBREW_TAP_TOKEN != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -224,7 +224,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [prepare, build, homebrew_tap]
+    needs: [prepare, build]
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
