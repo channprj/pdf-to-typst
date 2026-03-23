@@ -21,9 +21,10 @@
 
 ```sh
 brew install channprj/tap/pdf-to-typst
+brew install channprj/tap/pdf-to-typst@0.260323.1
 ```
 
-> **참고:** 현재 tap은 macOS에서 소스 빌드로 설치되며, helper script는
+> **참고:** tap은 각 릴리즈의 태그 소스 아카이브에서 빌드되며, helper script는
 > Homebrew의 `lib/pdf-to-typst/tools` 경로에 배치됩니다.
 
 ### GitHub Releases에서 다운로드
@@ -32,7 +33,8 @@ brew install channprj/tap/pdf-to-typst
 머지된 커밋 메시지에 `release`가 포함되거나, 릴리즈 워크플로를 수동 실행했을 때
 미리 빌드된 아카이브가 올라갑니다. 릴리즈 버전은 저장소 루트의 `VERSION`
 파일에서 직접 읽으며, 예시는 `v0.260323.1`입니다. 이 값은 Git 태그,
-GitHub Release, `pdf-to-typst --version` 출력에 동일하게 사용됩니다.
+GitHub Release, `pdf-to-typst --version` 출력, `channprj/tap` Homebrew
+포뮬러에 동일하게 사용됩니다.
 다음 대상의 바이너리가 게시됩니다.
 
 | 플랫폼 | Target |
