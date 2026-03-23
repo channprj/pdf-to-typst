@@ -11,6 +11,10 @@ fn binary() -> Command {
     Command::new(env!("CARGO_BIN_EXE_pdf-to-typst"))
 }
 
+fn expected_version() -> &'static str {
+    include_str!("../VERSION").trim()
+}
+
 fn test_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -974,7 +978,7 @@ fn build_rich_pdf(pages: &[RichPageSpec<'_>], images: &[ImageObjectSpec<'_>]) ->
 }
 
 #[test]
-fn help_text_documents_required_arguments_and_strict_mode() {
+fn help_text_documents_required_arguments_and_supported_flags() {
     let output = binary()
         .arg("--help")
         .output()
@@ -988,6 +992,37 @@ fn help_text_documents_required_arguments_and_strict_mode() {
     assert!(stdout.contains("<INPUT_PDF>"));
     assert!(stdout.contains("<OUTPUT_DIR>"));
     assert!(stdout.contains("--strict"));
+    assert!(stdout.contains("-v, --version"));
+}
+
+#[test]
+fn version_flag_prints_version_from_version_file() {
+    let output = binary()
+        .arg("--version")
+        .output()
+        .expect("version command should execute");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        expected_version()
+    );
+}
+
+#[test]
+fn short_version_flag_prints_version_from_version_file() {
+    let output = binary()
+        .arg("-v")
+        .output()
+        .expect("short version command should execute");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        expected_version()
+    );
 }
 
 #[test]

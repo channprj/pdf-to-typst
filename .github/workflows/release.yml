@@ -16,7 +16,6 @@ jobs:
     name: Prepare release metadata
     runs-on: ubuntu-latest
     outputs:
-      run_id: ${{ steps.meta.outputs.run_id }}
       should_release: ${{ steps.meta.outputs.should_release }}
       version_tag: ${{ steps.meta.outputs.version_tag }}
     steps:
@@ -35,10 +34,16 @@ jobs:
             exit 1
           fi
 
-          MAJOR="$(grep '^version = ' Cargo.toml | head -n1 | cut -d'"' -f2 | cut -d'.' -f1)"
-          DATE_YYMMDD="$(TZ=Asia/Seoul date +'%y%m%d')"
-          RUN_ID="${{ github.run_id }}"
-          VERSION_TAG="v${MAJOR}.${DATE_YYMMDD}.${RUN_ID}"
+          VERSION_TAG="$(tr -d '[:space:]' < VERSION)"
+          if [[ -z "${VERSION_TAG}" ]]; then
+            echo "error: VERSION must not be empty" >&2
+            exit 1
+          fi
+
+          if [[ ! "${VERSION_TAG}" =~ ^v[0-9]+\.[0-9]{6}\.[0-9]+$ ]]; then
+            echo "error: VERSION must match v{major}.{YYMMDD}.{ID}; got ${VERSION_TAG}" >&2
+            exit 1
+          fi
           COMMIT_MESSAGE="$(git log -1 --pretty=%B)"
           SHOULD_RELEASE=false
 
@@ -46,7 +51,6 @@ jobs:
             SHOULD_RELEASE=true
           fi
 
-          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
           echo "should_release=${SHOULD_RELEASE}" >> "$GITHUB_OUTPUT"
           echo "version_tag=${VERSION_TAG}" >> "$GITHUB_OUTPUT"
 
@@ -107,7 +111,6 @@ jobs:
         shell: bash
         env:
           VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
-          RUN_ID: ${{ needs.prepare.outputs.run_id }}
         run: |
           ARCHIVE="pdf-to-typst-${VERSION_TAG}-${{ matrix.target }}"
           mkdir -p "${ARCHIVE}"

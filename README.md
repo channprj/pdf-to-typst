@@ -31,9 +31,10 @@ brew install channprj/tap/pdf-to-typst
 Pre-built archives are published on
 [Releases](https://github.com/channprj/pdf-to-typst/releases) whenever a commit
 landed on `main` includes the word `release` in its commit message, or when the
-release workflow is triggered manually. Release tags use the format
-`v{major}.{YYMMDD}.{RUN_ID}`, for example `v0.260319.123456789`, where
-`RUN_ID` is `github.run_id`. Archives are published for:
+release workflow is triggered manually. The release version is read directly
+from the repository's `VERSION` file, for example `v0.260323.1`, and the same
+value is used for Git tags, GitHub Releases, and `pdf-to-typst --version`.
+Archives are published for:
 
 | Platform | Target |
 |----------|--------|
@@ -44,6 +45,7 @@ release workflow is triggered manually. Release tags use the format
 ```sh
 tar xzf pdf-to-typst-v*.tar.gz
 cd pdf-to-typst-v*
+./pdf-to-typst --version
 ./pdf-to-typst input.pdf output/
 ```
 

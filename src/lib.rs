@@ -27,6 +27,7 @@ Required arguments:
 
 Options:
   --strict      Treat warnings as fatal errors.
+  -v, --version Print the release version.
   -h, --help    Print this help text.
 ";
 
@@ -118,11 +119,21 @@ impl fmt::Display for CliFailure {
     }
 }
 
+pub enum ParseResult {
+    Help,
+    Version,
+    Run(CliOptions),
+}
+
 pub fn help_text() -> &'static str {
     HELP_TEXT
 }
 
-pub fn parse_args<I>(args: I) -> Result<Option<CliOptions>, CliFailure>
+pub fn version_text() -> &'static str {
+    include_str!("../VERSION").trim()
+}
+
+pub fn parse_args<I>(args: I) -> Result<ParseResult, CliFailure>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -131,7 +142,8 @@ where
 
     for arg in args.into_iter().skip(1) {
         match arg.to_string_lossy().as_ref() {
-            "-h" | "--help" => return Ok(None),
+            "-h" | "--help" => return Ok(ParseResult::Help),
+            "-v" | "--version" => return Ok(ParseResult::Version),
             "--strict" => strict = true,
             flag if flag.starts_with('-') => {
                 return Err(CliFailure::usage(format!("unknown option: {flag}")));
@@ -141,7 +153,7 @@ where
     }
 
     match positional.as_slice() {
-        [input_pdf, output_dir] => Ok(Some(CliOptions {
+        [input_pdf, output_dir] => Ok(ParseResult::Run(CliOptions {
             input_pdf: input_pdf.clone(),
             output_dir: output_dir.clone(),
             strict,
