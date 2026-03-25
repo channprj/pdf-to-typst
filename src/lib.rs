@@ -2684,11 +2684,11 @@ impl OcrEngine {
             .arg("6")
             .arg("tsv")
             .output();
-        cleanup_temp_ocr_image(&temp_path);
 
         let output = match output {
             Ok(output) => output,
             Err(error) => {
+                cleanup_temp_ocr_image(&temp_path);
                 return OcrPageResult {
                     lines: Vec::new(),
                     warnings: vec![Warning::new(format!(
@@ -2716,9 +2716,10 @@ impl OcrEngine {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed = match parse_ocr_tsv(&stdout, page_number) {
+        let mut parsed = match parse_ocr_tsv(&stdout, page_number) {
             Ok(parsed) => parsed,
             Err(reason) => {
+                cleanup_temp_ocr_image(&temp_path);
                 return OcrPageResult {
                     lines: Vec::new(),
                     warnings: vec![Warning::new(format!(
@@ -2729,6 +2730,7 @@ impl OcrEngine {
         };
 
         if parsed.lines.is_empty() {
+            cleanup_temp_ocr_image(&temp_path);
             return OcrPageResult {
                 lines: Vec::new(),
                 warnings: vec![Warning::new(format!(
@@ -2737,6 +2739,17 @@ impl OcrEngine {
                 ))],
             };
         }
+
+        if ocr_output_needs_plain_text_refinement(&parsed.lines)
+            && let Some(refined_lines) = self.ocr_plain_text_lines(&temp_path)
+            && refined_lines.len() == parsed.lines.len()
+        {
+            for (line, refined_text) in parsed.lines.iter_mut().zip(refined_lines) {
+                line.text = refined_text;
+            }
+        }
+
+        cleanup_temp_ocr_image(&temp_path);
 
         let mut warnings = Vec::new();
         if parsed
@@ -2808,6 +2821,26 @@ impl OcrEngine {
 
         self.availability = OcrAvailability::Available;
         Ok(())
+    }
+
+    fn ocr_plain_text_lines(&self, image_path: &Path) -> Option<Vec<String>> {
+        let output = Command::new(&self.command)
+            .arg(image_path)
+            .arg("stdout")
+            .arg("-l")
+            .arg(&self.language_profile)
+            .arg("--psm")
+            .arg("6")
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        Some(parse_ocr_plain_text_lines(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
     }
 }
 
@@ -3014,6 +3047,38 @@ fn join_ocr_words(words: &[(f32, String)]) -> String {
         .map(|(_, text)| text.as_str())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn parse_ocr_plain_text_lines(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .map(normalize_extracted_text)
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn ocr_output_needs_plain_text_refinement(lines: &[ExtractedLine]) -> bool {
+    lines
+        .iter()
+        .any(|line| line_has_fragmented_spaceless_script_spacing(&line.text))
+}
+
+fn line_has_fragmented_spaceless_script_spacing(text: &str) -> bool {
+    let mut run_length = 0usize;
+
+    for token in text.split_whitespace() {
+        if token.chars().count() == 1 && token.chars().all(is_spaceless_script_char) {
+            run_length += 1;
+            if run_length >= 2 {
+                return true;
+            }
+        } else {
+            run_length = 0;
+        }
+    }
+
+    false
 }
 
 fn take_numbers(operands: &[Operand], count: usize) -> Option<Vec<f32>> {
@@ -3829,6 +3894,15 @@ fn typst_bracket_text(text: &str) -> String {
         .replace('[', "\\[")
         .replace(']', "\\]")
         .replace('#', "\\#")
+        .replace('@', "\\@")
+}
+
+fn typst_plain_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+        .replace('#', "\\#")
+        .replace('@', "\\@")
 }
 
 fn render_document_blocks(blocks: Vec<String>) -> String {
@@ -3861,13 +3935,13 @@ fn render_text_blocks(lines: Vec<ExtractedLine>) -> Vec<String> {
         }
 
         if is_heading_line(line, &plain, body_font_size) {
-            blocks.push(format!("= {}", plain));
+            blocks.push(format!("= {}", typst_plain_text(&plain)));
             index += 1;
             continue;
         }
 
         if let Some(item) = normalize_list_item(&plain) {
-            let mut items = vec![format!("- {}", item)];
+            let mut items = vec![format!("- {}", typst_plain_text(&item))];
             index += 1;
 
             while let Some(next_line) = lines.get(index) {
@@ -3876,7 +3950,7 @@ fn render_text_blocks(lines: Vec<ExtractedLine>) -> Vec<String> {
                     break;
                 };
 
-                items.push(format!("- {}", next_item));
+                items.push(format!("- {}", typst_plain_text(&next_item)));
                 index += 1;
             }
 
@@ -3944,7 +4018,7 @@ fn render_text_blocks(lines: Vec<ExtractedLine>) -> Vec<String> {
             index += 1;
         }
 
-        blocks.push(paragraph.join(" "));
+        blocks.push(typst_plain_text(&paragraph.join(" ")));
     }
 
     blocks
@@ -3986,18 +4060,65 @@ fn collapse_lines(mut lines: Vec<ExtractedLine>) -> Vec<ExtractedLine> {
 
 fn append_fragment(existing: &mut String, fragment: &str) {
     let trimmed = fragment.trim();
+    let carries_boundary_space = existing.chars().last().is_some_and(char::is_whitespace)
+        || fragment.chars().next().is_some_and(char::is_whitespace);
+    let keep_trailing_space = fragment.chars().last().is_some_and(char::is_whitespace);
+
     if trimmed.is_empty() {
+        if carries_boundary_space
+            && !existing.is_empty()
+            && !existing.ends_with(char::is_whitespace)
+        {
+            existing.push(' ');
+        }
         return;
     }
 
-    if existing.ends_with(char::is_alphanumeric)
-        && trimmed.starts_with(char::is_alphanumeric)
-        && !existing.ends_with(' ')
+    trim_trailing_whitespace(existing);
+
+    if !existing.is_empty()
+        && (carries_boundary_space
+            || existing
+                .chars()
+                .last()
+                .zip(trimmed.chars().next())
+                .is_some_and(|(left, right)| should_insert_synthetic_space(left, right)))
     {
         existing.push(' ');
     }
 
     existing.push_str(trimmed);
+
+    if keep_trailing_space {
+        existing.push(' ');
+    }
+}
+
+fn trim_trailing_whitespace(text: &mut String) {
+    while text.chars().last().is_some_and(char::is_whitespace) {
+        text.pop();
+    }
+}
+
+fn should_insert_synthetic_space(left: char, right: char) -> bool {
+    if is_spaceless_script_char(left) && is_spaceless_script_char(right) {
+        return false;
+    }
+
+    left.is_alphanumeric() && right.is_alphanumeric()
+}
+
+fn is_spaceless_script_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x1100..=0x11FF
+            | 0x3130..=0x318F
+            | 0xAC00..=0xD7AF
+            | 0x3040..=0x309F
+            | 0x30A0..=0x30FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+    )
 }
 
 fn infer_body_font_size(lines: &[ExtractedLine]) -> f32 {
@@ -4093,8 +4214,12 @@ fn max_backtick_run(input: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{PageRecovery, page_recovery_for_warning, pdfkit_helper_paths};
-    use std::path::Path;
+    use super::{
+        DocumentExtractionStrategy, ExtractedLine, OcrEngine, PageRecovery, ParsedPdf,
+        append_fragment, collapse_lines, line_has_fragmented_spaceless_script_spacing,
+        page_recovery_for_warning, parse_page_data, pdfkit_helper_paths, typst_plain_text,
+    };
+    use std::{fs, path::Path};
 
     #[test]
     fn xobject_warnings_trigger_pdfkit_recovery() {
@@ -4138,5 +4263,177 @@ mod tests {
         assert!(cache_b.starts_with(workspace_b));
         assert_ne!(binary_a, binary_b);
         assert_ne!(cache_a, cache_b);
+    }
+
+    #[test]
+    fn append_fragment_keeps_hangul_syllables_searchable() {
+        let mut text = String::from("인");
+        append_fragment(&mut text, "간");
+        append_fragment(&mut text, "을");
+
+        assert_eq!(text, "인간을");
+    }
+
+    #[test]
+    fn append_fragment_still_separates_ascii_words_without_explicit_spaces() {
+        let mut text = String::from("Meeting");
+        append_fragment(&mut text, "Notes");
+
+        assert_eq!(text, "Meeting Notes");
+    }
+
+    #[test]
+    fn collapse_lines_preserves_explicit_korean_word_boundaries() {
+        let collapsed = collapse_lines(vec![
+            ExtractedLine {
+                id: 0,
+                page_number: 1,
+                x: 72.0,
+                y: 720.0,
+                font_size: 18.0,
+                sequence: 0,
+                text: "글 ".to_string(),
+            },
+            ExtractedLine {
+                id: 1,
+                page_number: 1,
+                x: 95.0,
+                y: 720.0,
+                font_size: 18.0,
+                sequence: 1,
+                text: "쓰는 ".to_string(),
+            },
+            ExtractedLine {
+                id: 2,
+                page_number: 1,
+                x: 135.0,
+                y: 720.0,
+                font_size: 18.0,
+                sequence: 2,
+                text: "인".to_string(),
+            },
+            ExtractedLine {
+                id: 3,
+                page_number: 1,
+                x: 149.0,
+                y: 720.0,
+                font_size: 18.0,
+                sequence: 3,
+                text: "간".to_string(),
+            },
+            ExtractedLine {
+                id: 4,
+                page_number: 1,
+                x: 163.0,
+                y: 720.0,
+                font_size: 18.0,
+                sequence: 4,
+                text: "을 ".to_string(),
+            },
+            ExtractedLine {
+                id: 5,
+                page_number: 1,
+                x: 186.0,
+                y: 720.0,
+                font_size: 18.0,
+                sequence: 5,
+                text: "위한 ".to_string(),
+            },
+            ExtractedLine {
+                id: 6,
+                page_number: 1,
+                x: 235.0,
+                y: 720.0,
+                font_size: 18.0,
+                sequence: 6,
+                text: "두 ".to_string(),
+            },
+            ExtractedLine {
+                id: 7,
+                page_number: 1,
+                x: 257.0,
+                y: 720.0,
+                font_size: 18.0,
+                sequence: 7,
+                text: "번째 ".to_string(),
+            },
+            ExtractedLine {
+                id: 8,
+                page_number: 1,
+                x: 298.0,
+                y: 720.0,
+                font_size: 18.0,
+                sequence: 8,
+                text: "뇌".to_string(),
+            },
+        ]);
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].text, "글 쓰는 인간을 위한 두 번째 뇌");
+    }
+
+    #[test]
+    fn fragmented_hangul_ocr_spacing_is_detected() {
+        assert!(line_has_fragmented_spaceless_script_spacing(
+            "글 쓰는 인 간 을 위한 두 번째 뇌"
+        ));
+        assert!(line_has_fragmented_spaceless_script_spacing(
+            "어떻게 스 마 트 하 게 쓸 것인가?"
+        ));
+        assert!(!line_has_fragmented_spaceless_script_spacing(
+            "스캔된 문서입니다. English text joins same paragraph."
+        ));
+    }
+
+    #[test]
+    fn plain_text_escapes_typst_reference_syntax() {
+        assert_eq!(typst_plain_text("@케 아렌스"), "\\@케 아렌스");
+    }
+
+    #[test]
+    fn ocr_rendering_keeps_real_korean_book_front_matter_searchable() {
+        let bytes = fs::read("data/kr-book-01.pdf").expect("fixture should be readable");
+        let pdf = ParsedPdf::parse(&bytes).expect("fixture should parse");
+        let page_refs = pdf.page_refs().expect("fixture should contain pages");
+
+        let page_1 = parse_page_data(&pdf, page_refs[0], 1).expect("page 1 should parse");
+        let page_3 = parse_page_data(&pdf, page_refs[2], 3).expect("page 3 should parse");
+
+        let mut ocr_engine = OcrEngine::from_env();
+        let page_1_text = super::convert_page_with_strategy(
+            Path::new("data/kr-book-01.pdf"),
+            page_1,
+            DocumentExtractionStrategy::Ocr,
+            None,
+            &mut ocr_engine,
+        )
+        .fragment
+        .expect("page 1 should render with OCR")
+        .blocks
+        .join("\n");
+        let page_3_text = super::convert_page_with_strategy(
+            Path::new("data/kr-book-01.pdf"),
+            page_3,
+            DocumentExtractionStrategy::Ocr,
+            None,
+            &mut ocr_engine,
+        )
+        .fragment
+        .expect("page 3 should render with OCR")
+        .blocks
+        .join("\n");
+
+        assert!(
+            page_1_text.contains("글 쓰는 인간을 위한 두 번째 뇌"),
+            "unexpected page 1 output:\n{page_1_text}"
+        );
+        assert!(
+            page_1_text.contains("어떻게 스마트하게 쓸 것인가"),
+            "unexpected page 1 output:\n{page_1_text}"
+        );
+        assert!(
+            page_3_text.contains("글을 쓰지 않고는 생각할 수 없다"),
+            "unexpected page 3 output:\n{page_3_text}"
+        );
     }
 }
