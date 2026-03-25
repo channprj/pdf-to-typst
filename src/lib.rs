@@ -35,6 +35,7 @@ const DEFAULT_OCR_LANGUAGES: &str = "kor+eng";
 const DEFAULT_OCR_MIN_CONFIDENCE: f32 = 65.0;
 const RASTER_FALLBACK_DPI: u32 = 144;
 const PDFKIT_RENDER_SCALE: f32 = 2.0;
+const STRATEGY_SAMPLE_PAGES: usize = 3;
 
 fn tools_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -65,7 +66,7 @@ pub struct CliOptions {
     pub strict: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Warning {
     message: String,
 }
@@ -292,118 +293,30 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
     }
 
     let mut warnings = Vec::new();
-    let mut pages = Vec::with_capacity(page_refs.len());
     let mut ocr_engine = OcrEngine::from_env();
+    let mut parsed_pages = Vec::with_capacity(page_refs.len());
+    for (page_index, page_ref) in page_refs.iter().enumerate() {
+        parsed_pages.push(parse_page_data(&pdf, *page_ref, page_index + 1)?);
+    }
+
+    let (document_strategy, sampled_ocr_attempts) =
+        choose_document_extraction_strategy(input_pdf, &parsed_pages, &mut ocr_engine);
+
+    let mut pages = Vec::with_capacity(parsed_pages.len());
     let mut pdfkit_render_pages = HashSet::new();
     let mut raster_fallback_pages = BTreeSet::new();
 
-    for (page_index, page_ref) in page_refs.iter().enumerate() {
-        let page_number = page_index + 1;
-        let content_refs = pdf.page_content_refs(*page_ref).map_err(|message| {
-            CliFailure::fatal(format!(
-                "error: failed to parse PDF page {page_number}: {message}"
-            ))
-        })?;
-        let page_images = pdf.page_image_resources(*page_ref).map_err(|message| {
-            CliFailure::fatal(format!(
-                "error: failed to parse PDF page {page_number}: {message}"
-            ))
-        })?;
+    for page in parsed_pages {
+        let page_number = page.number;
+        let converted = convert_page_with_strategy(
+            input_pdf,
+            page,
+            document_strategy,
+            sampled_ocr_attempts.get(&page_number).cloned(),
+            &mut ocr_engine,
+        );
 
-        let mut page_lines = Vec::new();
-        let mut page_warnings = Vec::new();
-        let mut page_xobjects = Vec::new();
-        let mut ocr_attempted = false;
-        let mut rendered_ocr_page = None;
-
-        for content_ref in content_refs {
-            match pdf.decode_content_stream(content_ref) {
-                Ok(Some(stream)) => match parse_content_stream(&stream, page_number) {
-                    Ok(parsed) => {
-                        page_lines.extend(parsed.lines);
-                        page_warnings.extend(parsed.warnings);
-                        page_xobjects.extend(parsed.xobject_invocations);
-                    }
-                    Err(message) => page_warnings.push(Warning::new(format!(
-                        "unsupported content on page {page_number}: {message}"
-                    ))),
-                },
-                Ok(None) => page_warnings.push(Warning::new(format!(
-                    "unsupported content on page {page_number}: unsupported stream filter"
-                ))),
-                Err(message) => page_warnings.push(Warning::new(format!(
-                    "unsupported content on page {page_number}: {message}"
-                ))),
-            }
-        }
-
-        if page_lines.is_empty() && !page_xobjects.is_empty() && page_images.image_count > 0 {
-            ocr_attempted = true;
-
-            if page_images.candidates.is_empty() {
-                page_warnings.push(Warning::new(format!(
-                    "OCR unavailable on page {page_number}: embedded image encoding is unsupported; scanned page content could not be extracted"
-                )));
-            } else {
-                rendered_ocr_page = render_page_png_for_ocr(input_pdf, page_number);
-                let rendered_candidates;
-                let ocr_candidates = if let Some(rendered) = rendered_ocr_page.as_ref() {
-                    rendered_candidates = vec![rendered.candidate.clone()];
-                    rendered_candidates.as_slice()
-                } else {
-                    page_images.candidates.as_slice()
-                };
-                let ocr_result = ocr_engine.ocr_page(page_number, ocr_candidates);
-                page_lines.extend(ocr_result.lines);
-                page_warnings.extend(ocr_result.warnings);
-            }
-        }
-
-        assign_line_ids(&mut page_lines);
-        let mut page_fragment = None;
-
-        if ocr_attempted {
-            if page_lines.is_empty() {
-                if let Some(rendered) = rendered_ocr_page.as_ref() {
-                    if rendered.is_blank {
-                        page_fragment = Some(render_blank_page_fragment(
-                            rendered.width_pt,
-                            rendered.height_pt,
-                        ));
-                    } else {
-                        page_warnings.push(Warning::new(format!(
-                            "unsupported content on page {page_number}: no digital text extracted"
-                        )));
-                    }
-                } else {
-                    page_warnings.push(Warning::new(format!(
-                        "unsupported content on page {page_number}: no digital text extracted"
-                    )));
-                }
-            } else {
-                page_fragment = Some(PageFragment {
-                    blocks: render_text_blocks(page_lines),
-                    assets: Vec::new(),
-                    layout: PageLayoutMode::Flow,
-                });
-            }
-        } else {
-            let rendered = render_page(page_number, page_lines, page_xobjects, page_images);
-            page_warnings.extend(rendered.warnings);
-            if rendered.blocks.is_empty() {
-                page_warnings.push(Warning::new(format!(
-                    "unsupported content on page {page_number}: no digital text extracted"
-                )));
-            } else {
-                page_fragment = Some(PageFragment {
-                    blocks: rendered.blocks,
-                    assets: rendered.assets,
-                    layout: PageLayoutMode::Flow,
-                });
-            }
-        }
-
-        match page_recovery_for_warnings(&page_warnings) {
+        match page_recovery_for_warnings(&converted.warnings) {
             Some(PageRecovery::Pdfkit) => {
                 pdfkit_render_pages.insert(page_number);
                 pages.push(PageAssembly {
@@ -419,10 +332,10 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
                 });
             }
             None => {
-                warnings.extend(dedupe_warnings(page_warnings));
+                warnings.extend(dedupe_warnings(converted.warnings));
                 pages.push(PageAssembly {
                     number: page_number,
-                    fragment: page_fragment,
+                    fragment: converted.fragment,
                 });
             }
         }
@@ -520,17 +433,43 @@ struct PageAssembly {
     fragment: Option<PageFragment>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DocumentExtractionStrategy {
+    Native,
+    Ocr,
+}
+
+struct ParsedPageData {
+    number: usize,
+    native_lines: Vec<ExtractedLine>,
+    native_warnings: Vec<Warning>,
+    xobjects: Vec<XObjectInvocation>,
+    image_resources: PageImageResources,
+}
+
+struct PageConversion {
+    warnings: Vec<Warning>,
+    fragment: Option<PageFragment>,
+}
+
 struct RasterizedPage {
     filename: String,
     width_pt: f32,
     height_pt: f32,
 }
 
+#[derive(Clone)]
 struct RenderedOcrPage {
     candidate: OcrImageCandidate,
     width_pt: f32,
     height_pt: f32,
     is_blank: bool,
+}
+
+#[derive(Clone)]
+struct OcrAttempt {
+    result: OcrPageResult,
+    rendered_page: Option<RenderedOcrPage>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -563,6 +502,230 @@ struct PositionedAsset {
     y_pt: f32,
     width_pt: f32,
     height_pt: f32,
+}
+
+fn parse_page_data(
+    pdf: &ParsedPdf,
+    page_ref: u32,
+    page_number: usize,
+) -> Result<ParsedPageData, CliFailure> {
+    let content_refs = pdf.page_content_refs(page_ref).map_err(|message| {
+        CliFailure::fatal(format!(
+            "error: failed to parse PDF page {page_number}: {message}"
+        ))
+    })?;
+    let image_resources = pdf.page_image_resources(page_ref).map_err(|message| {
+        CliFailure::fatal(format!(
+            "error: failed to parse PDF page {page_number}: {message}"
+        ))
+    })?;
+
+    let mut native_lines = Vec::new();
+    let mut native_warnings = Vec::new();
+    let mut xobjects = Vec::new();
+
+    for content_ref in content_refs {
+        match pdf.decode_content_stream(content_ref) {
+            Ok(Some(stream)) => match parse_content_stream(&stream, page_number) {
+                Ok(parsed) => {
+                    native_lines.extend(parsed.lines);
+                    native_warnings.extend(parsed.warnings);
+                    xobjects.extend(parsed.xobject_invocations);
+                }
+                Err(message) => native_warnings.push(Warning::new(format!(
+                    "unsupported content on page {page_number}: {message}"
+                ))),
+            },
+            Ok(None) => native_warnings.push(Warning::new(format!(
+                "unsupported content on page {page_number}: unsupported stream filter"
+            ))),
+            Err(message) => native_warnings.push(Warning::new(format!(
+                "unsupported content on page {page_number}: {message}"
+            ))),
+        }
+    }
+
+    Ok(ParsedPageData {
+        number: page_number,
+        native_lines,
+        native_warnings,
+        xobjects,
+        image_resources,
+    })
+}
+
+fn choose_document_extraction_strategy(
+    input_pdf: &Path,
+    pages: &[ParsedPageData],
+    ocr_engine: &mut OcrEngine,
+) -> (DocumentExtractionStrategy, HashMap<usize, OcrAttempt>) {
+    let sample_count = pages.len().min(STRATEGY_SAMPLE_PAGES);
+    let mut ocr_favored_pages = 0usize;
+    let mut sampled_ocr_attempts = HashMap::new();
+
+    for page in pages.iter().take(sample_count) {
+        let native_score = text_extraction_score(&page.native_lines);
+        let ocr_attempt =
+            run_ocr_attempt(input_pdf, page.number, &page.image_resources, ocr_engine);
+        let ocr_score = text_extraction_score(&ocr_attempt.result.lines);
+        if sample_page_prefers_ocr(native_score, ocr_score) {
+            ocr_favored_pages += 1;
+        }
+        sampled_ocr_attempts.insert(page.number, ocr_attempt);
+    }
+
+    let strategy = if sample_count > 0 && ocr_favored_pages == sample_count {
+        DocumentExtractionStrategy::Ocr
+    } else {
+        DocumentExtractionStrategy::Native
+    };
+
+    (strategy, sampled_ocr_attempts)
+}
+
+fn sample_page_prefers_ocr(native_score: usize, ocr_score: usize) -> bool {
+    ocr_score > 0
+        && (native_score == 0 || (native_score < 40 && ocr_score >= native_score.saturating_mul(2)))
+}
+
+fn text_extraction_score(lines: &[ExtractedLine]) -> usize {
+    lines
+        .iter()
+        .map(|line| line.text.chars().filter(|ch| !ch.is_whitespace()).count())
+        .sum()
+}
+
+fn convert_page_with_strategy(
+    input_pdf: &Path,
+    page: ParsedPageData,
+    strategy: DocumentExtractionStrategy,
+    sampled_ocr_attempt: Option<OcrAttempt>,
+    ocr_engine: &mut OcrEngine,
+) -> PageConversion {
+    let has_native_recovery_path =
+        !page.xobjects.is_empty() || page_recovery_for_warnings(&page.native_warnings).is_some();
+    let should_try_ocr = strategy == DocumentExtractionStrategy::Ocr
+        || (page.native_lines.is_empty()
+            && (!has_native_recovery_path || sampled_ocr_attempt.is_some()));
+
+    if should_try_ocr {
+        let ocr_page = convert_page_with_ocr(
+            input_pdf,
+            page.number,
+            &page.native_warnings,
+            &page.image_resources,
+            sampled_ocr_attempt,
+            ocr_engine,
+        );
+        if ocr_page.fragment.is_some() || page.native_lines.is_empty() {
+            return ocr_page;
+        }
+    }
+
+    convert_page_with_native(page)
+}
+
+fn convert_page_with_ocr(
+    input_pdf: &Path,
+    page_number: usize,
+    native_warnings: &[Warning],
+    image_resources: &PageImageResources,
+    sampled_ocr_attempt: Option<OcrAttempt>,
+    ocr_engine: &mut OcrEngine,
+) -> PageConversion {
+    let mut warnings = native_warnings.to_vec();
+    let OcrAttempt {
+        result,
+        rendered_page,
+    } = sampled_ocr_attempt
+        .unwrap_or_else(|| run_ocr_attempt(input_pdf, page_number, image_resources, ocr_engine));
+    let mut page_lines = result.lines;
+    assign_line_ids(&mut page_lines);
+
+    let fragment = if page_lines.is_empty() {
+        if let Some(rendered) = rendered_page.as_ref() {
+            if rendered.is_blank {
+                Some(render_blank_page_fragment(
+                    rendered.width_pt,
+                    rendered.height_pt,
+                ))
+            } else {
+                warnings.extend(result.warnings);
+                warnings.push(Warning::new(format!(
+                    "unsupported content on page {page_number}: no digital text extracted"
+                )));
+                None
+            }
+        } else {
+            warnings.extend(result.warnings);
+            warnings.push(Warning::new(format!(
+                "unsupported content on page {page_number}: no digital text extracted"
+            )));
+            None
+        }
+    } else {
+        warnings.extend(result.warnings);
+        Some(PageFragment {
+            blocks: render_text_blocks(page_lines),
+            assets: Vec::new(),
+            layout: PageLayoutMode::Flow,
+        })
+    };
+
+    PageConversion { warnings, fragment }
+}
+
+fn convert_page_with_native(page: ParsedPageData) -> PageConversion {
+    let ParsedPageData {
+        number,
+        mut native_lines,
+        mut native_warnings,
+        xobjects,
+        image_resources,
+    } = page;
+
+    assign_line_ids(&mut native_lines);
+    let rendered = render_page(number, native_lines, xobjects, image_resources);
+    native_warnings.extend(rendered.warnings);
+
+    let fragment = if rendered.blocks.is_empty() {
+        native_warnings.push(Warning::new(format!(
+            "unsupported content on page {number}: no digital text extracted"
+        )));
+        None
+    } else {
+        Some(PageFragment {
+            blocks: rendered.blocks,
+            assets: rendered.assets,
+            layout: PageLayoutMode::Flow,
+        })
+    };
+
+    PageConversion {
+        warnings: native_warnings,
+        fragment,
+    }
+}
+
+fn run_ocr_attempt(
+    input_pdf: &Path,
+    page_number: usize,
+    image_resources: &PageImageResources,
+    ocr_engine: &mut OcrEngine,
+) -> OcrAttempt {
+    let rendered_page = render_page_png_for_ocr(input_pdf, page_number);
+    let rendered_candidates;
+    let ocr_candidates = if let Some(rendered) = rendered_page.as_ref() {
+        rendered_candidates = vec![rendered.candidate.clone()];
+        rendered_candidates.as_slice()
+    } else {
+        image_resources.candidates.as_slice()
+    };
+
+    OcrAttempt {
+        result: ocr_engine.ocr_page(page_number, ocr_candidates),
+        rendered_page,
+    }
 }
 
 fn page_recovery_for_warning(message: &str) -> Option<PageRecovery> {
@@ -1242,7 +1405,6 @@ struct PdfObject {
 }
 
 struct PageImageResources {
-    image_count: usize,
     resources: HashMap<String, PageImageResource>,
     candidates: Vec<OcrImageCandidate>,
 }
@@ -1388,7 +1550,6 @@ impl ParsedPdf {
             extract_dictionary_or_reference_value(&page.dictionary, "/Resources")
         else {
             return Ok(PageImageResources {
-                image_count: 0,
                 resources: HashMap::new(),
                 candidates: Vec::new(),
             });
@@ -1397,14 +1558,12 @@ impl ParsedPdf {
         let Some(xobject_value) = extract_dictionary_or_reference_value(resources, "/XObject")
         else {
             return Ok(PageImageResources {
-                image_count: 0,
                 resources: HashMap::new(),
                 candidates: Vec::new(),
             });
         };
         let xobjects = self.resolve_dictionary_value(xobject_value)?;
         let refs = parse_named_reference_map(xobjects);
-        let mut image_count = 0usize;
         let mut resources = HashMap::new();
         let mut candidates = Vec::new();
 
@@ -1414,8 +1573,6 @@ impl ParsedPdf {
                 continue;
             }
 
-            image_count += 1;
-
             let resource = self.image_resource(name.clone(), image_ref)?;
             if let Some(candidate) = resource.ocr_candidate.as_ref() {
                 candidates.push(candidate.clone());
@@ -1424,7 +1581,6 @@ impl ParsedPdf {
         }
 
         Ok(PageImageResources {
-            image_count,
             resources,
             candidates,
         })
@@ -2391,6 +2547,7 @@ fn parse_content_stream(stream: &[u8], page_number: usize) -> Result<ParsedConte
     })
 }
 
+#[derive(Clone)]
 struct OcrPageResult {
     lines: Vec<ExtractedLine>,
     warnings: Vec<Warning>,

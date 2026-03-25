@@ -304,6 +304,183 @@ EOF
     fake_tesseract
 }
 
+fn ocr_tsv_for_text_with_confidence(text: &str, confidence: u8) -> String {
+    format!(
+        "cat <<'EOF'\n\
+level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+1\t1\t0\t0\t0\t0\t0\t0\t1000\t1400\t-1\t\n\
+2\t1\t1\t0\t0\t0\t60\t80\t620\t290\t-1\t\n\
+3\t1\t1\t1\t0\t0\t60\t80\t620\t290\t-1\t\n\
+4\t1\t1\t1\t1\t0\t60\t80\t420\t42\t-1\t\n\
+5\t1\t1\t1\t1\t1\t60\t80\t420\t42\t{confidence}\t{text}\n\
+EOF\n"
+    )
+}
+
+fn ocr_tsv_for_text(text: &str) -> String {
+    ocr_tsv_for_text_with_confidence(text, 96)
+}
+
+fn ocr_tsv_without_text() -> String {
+    "cat <<'EOF'\n\
+level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+1\t1\t0\t0\t0\t0\t0\t0\t1000\t1400\t-1\t\n\
+EOF\n"
+        .to_string()
+}
+
+fn install_counting_ocr_stub(output_root: &Path, responses: &[&str]) -> (PathBuf, PathBuf) {
+    let fake_tesseract = output_root.join("fake-tesseract-counting.sh");
+    let invocation_log = output_root.join("counting-ocr.log");
+    let counter_file = output_root.join("counting-ocr-count.txt");
+
+    let mut body = String::new();
+    for (index, response) in responses.iter().enumerate() {
+        body.push_str(&format!("  {})\n", index + 1));
+        body.push_str(&ocr_tsv_for_text(response));
+        body.push_str("    ;;\n");
+    }
+
+    let default_response = responses.last().copied().unwrap_or("OCR text");
+    body.push_str("  *)\n");
+    body.push_str(&ocr_tsv_for_text(default_response));
+    body.push_str("    ;;\n");
+
+    write_script(
+        &fake_tesseract,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+if [ "${{1:-}}" = "--list-langs" ]; then
+  printf 'List of available languages in "/tmp/tessdata/" (2):\neng\nkor\n'
+  exit 0
+fi
+count_file="{}"
+log_file="{}"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf '%s\t%s\n' "$count" "$1" >> "$log_file"
+case "$count" in
+{}esac
+"#,
+            counter_file.display(),
+            invocation_log.display(),
+            body
+        ),
+    );
+
+    (fake_tesseract, invocation_log)
+}
+
+fn install_optional_counting_ocr_stub(
+    output_root: &Path,
+    responses: &[Option<&str>],
+) -> (PathBuf, PathBuf) {
+    let fake_tesseract = output_root.join("fake-tesseract-optional.sh");
+    let invocation_log = output_root.join("optional-ocr.log");
+    let counter_file = output_root.join("optional-ocr-count.txt");
+
+    let mut body = String::new();
+    for (index, response) in responses.iter().enumerate() {
+        body.push_str(&format!("  {})\n", index + 1));
+        match response {
+            Some(text) => body.push_str(&ocr_tsv_for_text(text)),
+            None => body.push_str(&ocr_tsv_without_text()),
+        }
+        body.push_str("    ;;\n");
+    }
+
+    body.push_str("  *)\n");
+    body.push_str(&ocr_tsv_without_text());
+    body.push_str("    ;;\n");
+
+    write_script(
+        &fake_tesseract,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+if [ "${{1:-}}" = "--list-langs" ]; then
+  printf 'List of available languages in "/tmp/tessdata/" (2):\neng\nkor\n'
+  exit 0
+fi
+count_file="{}"
+log_file="{}"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf '%s\t%s\n' "$count" "$1" >> "$log_file"
+case "$count" in
+{}esac
+"#,
+            counter_file.display(),
+            invocation_log.display(),
+            body
+        ),
+    );
+
+    (fake_tesseract, invocation_log)
+}
+
+fn install_low_confidence_counting_ocr_stub(
+    output_root: &Path,
+    responses: &[(&str, u8)],
+) -> (PathBuf, PathBuf) {
+    let fake_tesseract = output_root.join("fake-tesseract-low-confidence.sh");
+    let invocation_log = output_root.join("low-confidence-ocr.log");
+    let counter_file = output_root.join("low-confidence-ocr-count.txt");
+
+    let mut body = String::new();
+    for (index, (text, confidence)) in responses.iter().enumerate() {
+        body.push_str(&format!("  {})\n", index + 1));
+        body.push_str(&ocr_tsv_for_text_with_confidence(text, *confidence));
+        body.push_str("    ;;\n");
+    }
+
+    let (default_text, default_confidence) = responses.last().copied().unwrap_or(("OCR text", 96));
+    body.push_str("  *)\n");
+    body.push_str(&ocr_tsv_for_text_with_confidence(
+        default_text,
+        default_confidence,
+    ));
+    body.push_str("    ;;\n");
+
+    write_script(
+        &fake_tesseract,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+if [ "${{1:-}}" = "--list-langs" ]; then
+  printf 'List of available languages in "/tmp/tessdata/" (2):\neng\nkor\n'
+  exit 0
+fi
+count_file="{}"
+log_file="{}"
+count=0
+if [ -f "$count_file" ]; then
+  count=$(cat "$count_file")
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+printf '%s\t%s\n' "$count" "$1" >> "$log_file"
+case "$count" in
+{}esac
+"#,
+            counter_file.display(),
+            invocation_log.display(),
+            body
+        ),
+    );
+
+    (fake_tesseract, invocation_log)
+}
+
 fn fail_sample(sample: &str, stage: &str, detail: impl AsRef<str>) -> ! {
     panic!(
         "sample {sample} regressed during {stage}: {}",
@@ -984,7 +1161,12 @@ fn help_text_documents_required_arguments_and_supported_flags() {
         .output()
         .expect("help command should execute");
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage: pdf-to-typst <INPUT_PDF> <OUTPUT_DIR> [OPTIONS]"));
@@ -1002,7 +1184,12 @@ fn version_flag_prints_version_from_version_file() {
         .output()
         .expect("version command should execute");
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
@@ -1017,7 +1204,12 @@ fn short_version_flag_prints_version_from_version_file() {
         .output()
         .expect("short version command should execute");
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stderr.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
@@ -1395,6 +1587,501 @@ fn scanned_pdf_reports_when_ocr_is_unavailable() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     assert_rasterized_page_output(&output_dir);
+}
+
+#[test]
+fn mixed_pdf_uses_sampled_ocr_strategy_for_later_pages() {
+    let output_root = test_path("sampled-ocr-default");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let (fake_tesseract, _) = install_counting_ocr_stub(
+        &output_root,
+        &[
+            "sample ocr page one",
+            "sample ocr page two",
+            "sample ocr page three",
+            "sample ocr page four",
+        ],
+    );
+    let pages = [
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "x1",
+            }],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "x2",
+            }],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "x3",
+            }],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "later page should not fall back to native text",
+            }],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+    ];
+    let images = [ImageObjectSpec {
+        name: "Im1",
+        width: 2,
+        height: 2,
+        color_space: "DeviceGray",
+        bits_per_component: 8,
+        filter: ImageObjectFilter::Flate,
+        bytes: &[0, 255, 255, 0],
+    }];
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&pages, &images));
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(output.status.success());
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("sample ocr page four"));
+    assert!(!main_typ.contains("later page should not fall back to native text"));
+}
+
+#[test]
+fn mixed_pdf_limits_ocr_strategy_sampling_to_first_three_pages() {
+    let output_root = test_path("sampled-native-default");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let (fake_tesseract, invocation_log) = install_counting_ocr_stub(
+        &output_root,
+        &["ocr", "ocr", "ocr", "page four ocr should never run"],
+    );
+    let pages = [
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Native sample page one has much richer text than OCR.",
+            }],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Native sample page two also has much richer text than OCR.",
+            }],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Native sample page three keeps the native strategy ahead.",
+            }],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Page four stays native because sampling stops at page three.",
+            }],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+    ];
+    let images = [ImageObjectSpec {
+        name: "Im1",
+        width: 2,
+        height: 2,
+        color_space: "DeviceGray",
+        bits_per_component: 8,
+        filter: ImageObjectFilter::Flate,
+        bytes: &[0, 255, 255, 0],
+    }];
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&pages, &images));
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(output.status.success());
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("Page four stays native because sampling stops at page three."));
+    assert!(!main_typ.contains("page four ocr should never run"));
+
+    let ocr_calls = read_to_string(&invocation_log).lines().count();
+    assert_eq!(ocr_calls, 3, "only the first three pages should be sampled");
+}
+
+#[test]
+fn mixed_pdf_samples_only_existing_pages_when_document_has_fewer_than_three_pages() {
+    let output_root = test_path("sampled-short-doc");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let (fake_tesseract, invocation_log) =
+        install_counting_ocr_stub(&output_root, &["ocr one", "ocr two", "ocr three"]);
+    let pages = [
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Short document page one keeps native text.",
+            }],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Short document page two is the last page to sample.",
+            }],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+    ];
+    let images = [ImageObjectSpec {
+        name: "Im1",
+        width: 2,
+        height: 2,
+        color_space: "DeviceGray",
+        bits_per_component: 8,
+        filter: ImageObjectFilter::Flate,
+        bytes: &[0, 255, 255, 0],
+    }];
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&pages, &images));
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(output.status.success());
+
+    let ocr_calls = read_to_string(&invocation_log).lines().count();
+    assert_eq!(ocr_calls, 2, "only existing pages should be sampled");
+}
+
+#[test]
+fn mixed_pdf_blank_sample_page_keeps_native_document_strategy() {
+    let output_root = test_path("sampled-blank-page-native-default");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let (fake_tesseract, invocation_log) = install_optional_counting_ocr_stub(
+        &output_root,
+        &[
+            Some(
+                "ocr sample page one would otherwise dominate with a much longer extracted passage that should not flip the whole document default by itself",
+            ),
+            None,
+            Some(
+                "ocr sample page three would otherwise dominate with another much longer extracted passage that should not flip the whole document default by itself",
+            ),
+            Some("page four ocr should never run"),
+        ],
+    );
+    let pages = [
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Substantive native sample page one.",
+            }],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Substantive native sample page three.",
+            }],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Later native page should stay native.",
+            }],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+    ];
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&pages, &[]));
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(output.status.success());
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("Later native page should stay native."));
+    assert!(!main_typ.contains("page four ocr should never run"));
+
+    let ocr_calls = read_to_string(&invocation_log).lines().count();
+    assert_eq!(
+        ocr_calls, 3,
+        "only the sampled pages should be dual-evaluated"
+    );
+}
+
+#[test]
+fn strict_mode_accepts_blank_sample_page_when_native_strategy_wins() {
+    let output_root = test_path("strict-sampled-blank-page");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let (fake_tesseract, invocation_log) = install_optional_counting_ocr_stub(
+        &output_root,
+        &[
+            Some(
+                "ocr sample page one would otherwise dominate with a much longer extracted passage that should not flip the whole document default by itself",
+            ),
+            None,
+            Some(
+                "ocr sample page three would otherwise dominate with another much longer extracted passage that should not flip the whole document default by itself",
+            ),
+            Some("page four ocr should never run"),
+        ],
+    );
+    let pages = [
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Substantive native sample page one.",
+            }],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Substantive native sample page three.",
+            }],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Later native page should stay native.",
+            }],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+    ];
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&pages, &[]));
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg(&input)
+        .arg(&output_dir)
+        .arg("--strict")
+        .output()
+        .expect("conversion should execute");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("Later native page should stay native."));
+    assert!(!main_typ.contains("page four ocr should never run"));
+
+    let ocr_calls = read_to_string(&invocation_log).lines().count();
+    assert_eq!(
+        ocr_calls, 3,
+        "only the sampled pages should be dual-evaluated"
+    );
+}
+
+#[test]
+fn strict_mode_uses_native_recovery_for_later_non_text_page_when_native_strategy_wins() {
+    let output_root = test_path("strict-native-later-non-text-page");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let (fake_tesseract, invocation_log) = install_low_confidence_counting_ocr_stub(
+        &output_root,
+        &[
+            (
+                "ocr sample page one would otherwise dominate with a much longer extracted passage that should not flip the whole document default by itself",
+                96,
+            ),
+            ("", 96),
+            (
+                "ocr sample page three would otherwise dominate with another much longer extracted passage that should not flip the whole document default by itself",
+                96,
+            ),
+            ("later ocr should never run", 20),
+        ],
+    );
+    let pages = [
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Substantive native sample page one.",
+            }],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Substantive native sample page three.",
+            }],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[],
+            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            xobjects: &["Im1"],
+        },
+    ];
+    let images = [ImageObjectSpec {
+        name: "Im1",
+        width: 2,
+        height: 2,
+        color_space: "DeviceGray",
+        bits_per_component: 8,
+        filter: ImageObjectFilter::Flate,
+        bytes: &[0, 255, 255, 0],
+    }];
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&pages, &images));
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg(&input)
+        .arg(&output_dir)
+        .arg("--strict")
+        .output()
+        .expect("conversion should execute");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(!main_typ.contains("later ocr should never run"));
+    assert!(
+        output_dir
+            .join("assets")
+            .join("page-4-image-1.png")
+            .exists(),
+        "native rendering should keep the later image page as an extracted asset"
+    );
+
+    let ocr_calls = read_to_string(&invocation_log).lines().count();
+    assert_eq!(
+        ocr_calls, 3,
+        "later non-text pages should not trigger OCR once the native default wins"
+    );
 }
 
 #[test]

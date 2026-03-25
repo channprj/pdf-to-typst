@@ -1,125 +1,177 @@
 {
-  "name": "PDF to Typst CLI MVP",
-  "branchName": "ralph/pdf-to-typst-cli-mvp",
+  "name": "kr-book-01.pdf 검증 기준의 pdf-to-typst 변환 품질 고도화",
+  "branchName": "ralph/kr-book-01-pdf-to-typst-quality",
   "userStories": [
     {
       "id": "US-001",
-      "title": "Define CLI contract and output layout",
-      "description": "As a developer, I want to convert one PDF into a predictable output directory so that I can inspect and compile the generated Typst files.",
+      "title": "Sample the first three pages to choose a default extraction strategy",
+      "description": "As a maintainer, I want the converter to compare native extraction and OCR on only the first three pages so that it can choose a deterministic whole-document default without paying full-document dual OCR cost.",
       "acceptanceCriteria": [
-        "The CLI accepts an input PDF path and an output directory path.",
-        "On success, the output directory contains one main .typ file and any referenced asset files.",
-        "The help text documents required arguments and key options, including --strict.",
-        "Success, success with warnings, and fatal failure behaviors are documented and covered by tests.",
-        "cargo fmt --check passes",
-        "cargo test passes"
+        "Use only pages 1-3 as the comparison sample when determining the document-wide default extraction strategy.",
+        "If the document has fewer than three pages, evaluate only the pages that exist.",
+        "Repeated runs on the same input choose the same default strategy.",
+        "Dual evaluation is limited to the sample pages instead of the whole document.",
+        "`cargo fmt --check` passes",
+        "`cargo clippy -- -D warnings` passes",
+        "`cargo test` passes",
+        "`cargo run -- ./data/kr-book-01.pdf /tmp/pdf-to-typst-kr-book-01-out --strict` passes",
+        "`typst compile /tmp/pdf-to-typst-kr-book-01-out/main.typ` passes",
+        "`--strict` execution uses an empty output directory",
+        "The ralph loop attempts whole-document render comparison and always rechecks the first three pages after each fix until quality is high"
       ],
       "priority": 1,
       "passes": true,
+      "notes": "",
       "dependsOn": [],
       "completionNotes": "Completed by agent"
     },
     {
       "id": "US-002",
-      "title": "Emit Typst from digital PDFs",
-      "description": "As a developer, I want text-based PDFs to be converted into valid Typst structure so that I can reuse existing digital documents without manual rewriting.",
+      "title": "Handle incomplete sample OCR data without aborting conversion",
+      "description": "As a maintainer, I want missing OCR or partial extraction failures in the sample pages to degrade gracefully so that strategy selection does not stop the conversion.",
       "acceptanceCriteria": [
-        "Digital PDF text is extracted in reading order.",
-        "Detectable structure, including headings, paragraphs, lists, and code-like blocks, is mapped to valid Typst syntax.",
-        "Document order is preserved across multi-page inputs.",
-        "Unsupported structures are surfaced through diagnostics instead of being silently dropped.",
-        "cargo fmt --check passes",
-        "cargo test passes"
+        "If a sampled page has no OCR candidate or unsupported OCR input, the converter emits a warning and continues.",
+        "Partial extraction failures during sample evaluation fall back to the best remaining signal instead of aborting the document.",
+        "After sample evaluation completes, the chosen strategy is reused for the rest of the document.",
+        "No new user-facing CLI flags or arguments are introduced for sample evaluation behavior.",
+        "`cargo fmt --check` passes",
+        "`cargo clippy -- -D warnings` passes",
+        "`cargo test` passes",
+        "`cargo run -- ./data/kr-book-01.pdf /tmp/pdf-to-typst-kr-book-01-out --strict` passes",
+        "`typst compile /tmp/pdf-to-typst-kr-book-01-out/main.typ` passes",
+        "`--strict` execution uses an empty output directory",
+        "The ralph loop attempts whole-document render comparison and always rechecks the first three pages after each fix until quality is high"
       ],
       "priority": 2,
-      "passes": true,
+      "passes": false,
+      "notes": "",
       "dependsOn": [
         "US-001"
-      ],
-      "completionNotes": "Completed by agent"
+      ]
     },
     {
       "id": "US-003",
-      "title": "Add OCR support for scanned Korean and English PDFs",
-      "description": "As a developer, I want scanned PDFs to go through OCR so that Korean and English mixed documents can also be converted into Typst.",
+      "title": "Preserve editable body text and reading order in Typst",
+      "description": "As a reader, I want normal text content to remain editable Typst text so that the output stays searchable, reusable, and close to the source PDF.",
       "acceptanceCriteria": [
-        "Image-based scanned PDFs can be processed through an OCR path.",
-        "The default OCR configuration targets mixed Korean and English documents.",
-        "OCR output flows into the same downstream Typst generation pipeline used for digital PDFs.",
-        "Unavailable OCR support or low-confidence OCR results produce diagnostics that explain the cause and impact.",
-        "cargo fmt --check passes",
-        "cargo test passes"
+        "On the first three pages of `kr-book-01.pdf`, body text appears in `main.typ` as Typst text literals rather than image assets.",
+        "The dominant reading order on the first three pages remains approximately top-to-bottom and left-to-right.",
+        "Extractable Korean text remains searchable and editable in the generated Typst output.",
+        "Ordinary body text, headings, and simple caption text are not replaced with raster assets.",
+        "`cargo fmt --check` passes",
+        "`cargo clippy -- -D warnings` passes",
+        "`cargo test` passes",
+        "`cargo run -- ./data/kr-book-01.pdf /tmp/pdf-to-typst-kr-book-01-out --strict` passes",
+        "`typst compile /tmp/pdf-to-typst-kr-book-01-out/main.typ` passes",
+        "`--strict` execution uses an empty output directory",
+        "The ralph loop attempts whole-document render comparison and always rechecks the first three pages after each fix until quality is high"
       ],
       "priority": 3,
-      "passes": true,
+      "passes": false,
+      "notes": "",
       "dependsOn": [
         "US-002"
-      ],
-      "completionNotes": "Completed by agent"
+      ]
     },
     {
       "id": "US-004",
-      "title": "Convert tables, images, and captions",
-      "description": "As a developer, I want non-text elements preserved in Typst so that converted documents remain useful beyond plain text extraction.",
+      "title": "Keep simple tables, figures, and captions on structured output paths",
+      "description": "As a reader, I want simple tables, figures, and captions to stay on structured Typst output paths whenever possible so that only genuinely hard regions need image fallback.",
       "acceptanceCriteria": [
-        "Detected images are extracted as reusable asset files and referenced from generated Typst.",
-        "Tables with sufficient structural confidence are emitted as Typst table elements.",
-        "Image and table captions are preserved when they can be detected.",
-        "When rich element conversion is incomplete or impossible, the degraded elements are recorded.",
-        "cargo fmt --check passes",
-        "cargo test passes"
+        "Structurally simple tables continue through a structured Typst output path instead of automatic raster fallback.",
+        "Ordinary figure placement and simple captions remain represented without flattening unrelated text.",
+        "Simple figure and table captions stay associated with their content when detected.",
+        "Pages that contain non-text elements still keep unrelated text editable.",
+        "`cargo fmt --check` passes",
+        "`cargo clippy -- -D warnings` passes",
+        "`cargo test` passes",
+        "`cargo run -- ./data/kr-book-01.pdf /tmp/pdf-to-typst-kr-book-01-out --strict` passes",
+        "`typst compile /tmp/pdf-to-typst-kr-book-01-out/main.typ` passes",
+        "`--strict` execution uses an empty output directory",
+        "The ralph loop attempts whole-document render comparison and always rechecks the first three pages after each fix until quality is high"
       ],
       "priority": 4,
-      "passes": true,
+      "passes": false,
+      "notes": "",
       "dependsOn": [
-        "US-002"
-      ],
-      "completionNotes": "Completed by agent"
+        "US-003"
+      ]
     },
     {
       "id": "US-005",
-      "title": "Support strict and non-strict conversion modes",
-      "description": "As a developer, I want to choose between best-effort conversion and fail-fast validation so that I can use the CLI for both exploration and strict pipelines.",
+      "title": "Rasterize only complex elements and ban whole-page fallback",
+      "description": "As a reader, I want only structurally complex tables, diagrams, and caption clusters to fall back to element images so that difficult regions stay legible without flattening the entire page.",
       "acceptanceCriteria": [
-        "The default mode continues conversion as far as possible and records warnings when unsupported elements are encountered.",
-        "The --strict mode treats unsupported or incomplete conversion as a failure instead of a warning.",
-        "Diagnostics include page-level or element-level context when available.",
-        "Tests verify the difference between default mode and --strict mode for the same failure case.",
-        "cargo fmt --check passes",
-        "cargo test passes"
+        "Element-level image fallback is used only when complexity signals such as failed structure extraction, merged cells, rotated structure, or nested caption clusters are detected.",
+        "When one element falls back to an image, unrelated text on the same page remains text output.",
+        "No page emits a whole-page raster fallback under any condition.",
+        "Any existing raster fallback behavior that conflicts with element-only fallback is removed or disabled.",
+        "`cargo fmt --check` passes",
+        "`cargo clippy -- -D warnings` passes",
+        "`cargo test` passes",
+        "`cargo run -- ./data/kr-book-01.pdf /tmp/pdf-to-typst-kr-book-01-out --strict` passes",
+        "`typst compile /tmp/pdf-to-typst-kr-book-01-out/main.typ` passes",
+        "`--strict` execution uses an empty output directory",
+        "The ralph loop attempts whole-document render comparison and always rechecks the first three pages after each fix until quality is high"
       ],
       "priority": 5,
-      "passes": true,
+      "passes": false,
+      "notes": "",
       "dependsOn": [
-        "US-002",
-        "US-003",
         "US-004"
-      ],
-      "completionNotes": "Completed by agent"
+      ]
     },
     {
       "id": "US-006",
-      "title": "Validate compileability and regression coverage",
-      "description": "As a developer, I want local regression checks on sample PDFs so that converted Typst output stays compilable as the converter evolves without tracking large fixtures in git.",
+      "title": "Emit compileable and comparison-stable strict-mode output",
+      "description": "As a maintainer, I want the generated Typst project for `kr-book-01.pdf` to compile cleanly in strict mode so that render comparison highlights meaningful regressions instead of broken output.",
       "acceptanceCriteria": [
-        "Local sample PDFs under ignored data/ can be exercised manually.",
-        "cargo test passes without requiring repository-tracked sample PDFs.",
-        "Manual regression coverage includes at least one digital PDF and one scanned mixed Korean and English PDF.",
-        "Test failures identify the affected sample and the conversion stage that regressed.",
-        "cargo fmt --check passes",
-        "cargo test passes"
+        "Running the strict sample conversion produces a project that compiles with `typst compile` without manual edits.",
+        "Paragraphs, tables, images, and captions keep roughly correct spatial relationships compared with the source PDF.",
+        "Minor kerning, tracking, or spacing differences are tolerated, but missing, duplicated, severely misplaced, or unreadable content is treated as failure.",
+        "The output structure stays stable enough to support repeatable comparison runs across the whole document.",
+        "`cargo fmt --check` passes",
+        "`cargo clippy -- -D warnings` passes",
+        "`cargo test` passes",
+        "`cargo run -- ./data/kr-book-01.pdf /tmp/pdf-to-typst-kr-book-01-out --strict` passes",
+        "`typst compile /tmp/pdf-to-typst-kr-book-01-out/main.typ` passes",
+        "`--strict` execution uses an empty output directory",
+        "The ralph loop attempts whole-document render comparison and always rechecks the first three pages after each fix until quality is high"
       ],
       "priority": 6,
-      "passes": true,
+      "passes": false,
+      "notes": "",
       "dependsOn": [
         "US-003",
-        "US-004",
         "US-005"
+      ]
+    },
+    {
+      "id": "US-007",
+      "title": "Keep iterative validation in the ralph session without changing the CLI",
+      "description": "As an operator, I want repeated validation to stay in the ralph session workflow so that converter quality can improve iteratively without adding retry orchestration to the CLI itself.",
+      "acceptanceCriteria": [
+        "The `pdf-to-typst` binary does not add internal retry, self-healing, or session orchestration behavior.",
+        "Repeated validation uses the fixed sample `./data/kr-book-01.pdf` after each code change.",
+        "Validation attempts a whole-document render comparison while treating the first three pages as a mandatory gate.",
+        "The CLI surface and arguments remain unchanged while the external validation workflow is reflected in project documentation or task notes.",
+        "`cargo fmt --check` passes",
+        "`cargo clippy -- -D warnings` passes",
+        "`cargo test` passes",
+        "`cargo run -- ./data/kr-book-01.pdf /tmp/pdf-to-typst-kr-book-01-out --strict` passes",
+        "`typst compile /tmp/pdf-to-typst-kr-book-01-out/main.typ` passes",
+        "`--strict` execution uses an empty output directory",
+        "The ralph loop attempts whole-document render comparison and always rechecks the first three pages after each fix until quality is high"
       ],
-      "completionNotes": "Completed by agent"
+      "priority": 7,
+      "passes": false,
+      "notes": "",
+      "dependsOn": [
+        "US-006"
+      ]
     }
   ],
   "metadata": {
-    "updatedAt": "2026-03-13T11:34:31.642Z"
+    "updatedAt": "2026-03-25T05:58:27.878Z"
   }
 }
