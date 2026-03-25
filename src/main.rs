@@ -12,8 +12,9 @@ fn main() -> ExitCode {
         }
         Ok(pdf_to_typst::ParseResult::Run(options)) => match pdf_to_typst::run(&options) {
             Ok(success) => {
-                if !success.warnings.is_empty() {
-                    for warning in success.warnings {
+                let mut seen_warnings = std::collections::HashSet::new();
+                for warning in success.warnings.into_iter().chain(success.notices) {
+                    if seen_warnings.insert(warning.message().to_string()) {
                         eprintln!("warning: {}", warning.message());
                     }
                 }

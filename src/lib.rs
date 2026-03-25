@@ -87,6 +87,7 @@ impl Warning {
 pub struct ConversionSuccess {
     pub main_typ: PathBuf,
     pub warnings: Vec<Warning>,
+    pub notices: Vec<Warning>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -173,13 +174,29 @@ pub fn run(options: &CliOptions) -> Result<ConversionSuccess, CliFailure> {
         return Err(strict_failure_from_warnings(&warnings));
     }
 
-    let document = convert_pdf(&options.input_pdf)?;
-    warnings.extend(document.warnings);
+    let ConvertedDocument {
+        typst,
+        assets,
+        warnings: document_warnings,
+        notices: document_notices,
+    } = convert_pdf(&options.input_pdf)?;
+    warnings.extend(document_warnings);
     let warnings = dedupe_warnings(warnings);
 
     if options.strict && !warnings.is_empty() {
         return Err(strict_failure_from_warnings(&warnings));
     }
+
+    let notices = dedupe_warnings(
+        document_notices
+            .into_iter()
+            .filter(|notice| {
+                !warnings
+                    .iter()
+                    .any(|warning| warning.message() == notice.message())
+            })
+            .collect(),
+    );
 
     fs::create_dir_all(&options.output_dir)
         .map_err(|error| CliFailure::fatal(format_output_error(&options.output_dir, &error)))?;
@@ -188,17 +205,21 @@ pub fn run(options: &CliOptions) -> Result<ConversionSuccess, CliFailure> {
     fs::create_dir_all(&assets_dir)
         .map_err(|error| CliFailure::fatal(format_output_error(&assets_dir, &error)))?;
 
-    for asset in document.assets {
+    for asset in assets {
         let asset_path = assets_dir.join(&asset.filename);
         fs::write(&asset_path, asset.bytes)
             .map_err(|error| CliFailure::fatal(format_output_error(&asset_path, &error)))?;
     }
 
     let main_typ = options.output_dir.join("main.typ");
-    fs::write(&main_typ, document.typst)
+    fs::write(&main_typ, typst)
         .map_err(|error| CliFailure::fatal(format_output_error(&main_typ, &error)))?;
 
-    Ok(ConversionSuccess { main_typ, warnings })
+    Ok(ConversionSuccess {
+        main_typ,
+        warnings,
+        notices,
+    })
 }
 
 fn validate_input(input_pdf: &Path) -> Result<(), CliFailure> {
@@ -299,7 +320,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
         parsed_pages.push(parse_page_data(&pdf, *page_ref, page_index + 1)?);
     }
 
-    let (document_strategy, sampled_ocr_attempts) =
+    let (document_strategy, sampled_ocr_attempts, notices) =
         choose_document_extraction_strategy(input_pdf, &parsed_pages, &mut ocr_engine);
 
     let mut pages = Vec::with_capacity(parsed_pages.len());
@@ -400,6 +421,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
         typst: render_document_blocks(blocks),
         assets,
         warnings: dedupe_warnings(warnings),
+        notices,
     })
 }
 
@@ -407,6 +429,7 @@ struct ConvertedDocument {
     typst: String,
     assets: Vec<OutputAsset>,
     warnings: Vec<Warning>,
+    notices: Vec<Warning>,
 }
 
 #[derive(Clone)]
@@ -470,6 +493,24 @@ struct RenderedOcrPage {
 struct OcrAttempt {
     result: OcrPageResult,
     rendered_page: Option<RenderedOcrPage>,
+}
+
+impl OcrAttempt {
+    fn has_usable_content(&self) -> bool {
+        !self.result.lines.is_empty()
+            || self
+                .rendered_page
+                .as_ref()
+                .is_some_and(|rendered| rendered.is_blank)
+    }
+
+    fn sample_evaluation_notices(&self, native_score: usize) -> Vec<Warning> {
+        if native_score == 0 || self.has_usable_content() {
+            Vec::new()
+        } else {
+            dedupe_warnings(self.result.warnings.clone())
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -558,15 +599,21 @@ fn choose_document_extraction_strategy(
     input_pdf: &Path,
     pages: &[ParsedPageData],
     ocr_engine: &mut OcrEngine,
-) -> (DocumentExtractionStrategy, HashMap<usize, OcrAttempt>) {
+) -> (
+    DocumentExtractionStrategy,
+    HashMap<usize, OcrAttempt>,
+    Vec<Warning>,
+) {
     let sample_count = pages.len().min(STRATEGY_SAMPLE_PAGES);
     let mut ocr_favored_pages = 0usize;
     let mut sampled_ocr_attempts = HashMap::new();
+    let mut notices = Vec::new();
 
     for page in pages.iter().take(sample_count) {
         let native_score = text_extraction_score(&page.native_lines);
         let ocr_attempt =
             run_ocr_attempt(input_pdf, page.number, &page.image_resources, ocr_engine);
+        notices.extend(ocr_attempt.sample_evaluation_notices(native_score));
         let ocr_score = text_extraction_score(&ocr_attempt.result.lines);
         if sample_page_prefers_ocr(native_score, ocr_score) {
             ocr_favored_pages += 1;
@@ -580,7 +627,7 @@ fn choose_document_extraction_strategy(
         DocumentExtractionStrategy::Native
     };
 
-    (strategy, sampled_ocr_attempts)
+    (strategy, sampled_ocr_attempts, dedupe_warnings(notices))
 }
 
 fn sample_page_prefers_ocr(native_score: usize, ocr_score: usize) -> bool {

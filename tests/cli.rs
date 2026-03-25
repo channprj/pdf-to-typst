@@ -234,6 +234,31 @@ EOF
     fake_tesseract
 }
 
+fn install_rejecting_ocr_stub(output_root: &Path, detail: &str) -> (PathBuf, PathBuf) {
+    let fake_tesseract = output_root.join("fake-tesseract-rejecting.sh");
+    let invocation_log = output_root.join("rejecting-ocr.log");
+
+    write_script(
+        &fake_tesseract,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+if [ "${{1:-}}" = "--list-langs" ]; then
+  printf 'List of available languages in "/tmp/tessdata/" (2):\neng\nkor\n'
+  exit 0
+fi
+printf '%s\n' "$1" >> "{}"
+echo "{}" >&2
+exit 1
+"#,
+            invocation_log.display(),
+            detail
+        ),
+    );
+
+    (fake_tesseract, invocation_log)
+}
+
 fn install_png_only_ocr_stub(output_root: &Path) -> PathBuf {
     let fake_tesseract = output_root.join("fake-tesseract-png-only.sh");
 
@@ -1901,6 +1926,182 @@ fn mixed_pdf_blank_sample_page_keeps_native_document_strategy() {
 }
 
 #[test]
+fn mixed_pdf_warns_when_sampled_ocr_input_is_unsupported_but_native_text_survives() {
+    let output_root = test_path("sampled-unsupported-ocr-input");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let (fake_tesseract, invocation_log) =
+        install_rejecting_ocr_stub(&output_root, "sample OCR input is unsupported");
+    let pages = [
+        RichPageSpec {
+            lines: &[
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 760.0,
+                    text: "Native sample page one keeps its text as the best remaining signal.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 724.0,
+                    text: "Dense native lines prevent sample OCR evaluation from being mistaken for a blank page.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 688.0,
+                    text: "When OCR input is unsupported, the converter should warn and keep going.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 652.0,
+                    text: "This page intentionally carries enough visible text to survive raster blank checks.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 616.0,
+                    text: "The sample strategy should still settle on the native path.",
+                },
+            ],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 760.0,
+                    text: "Native sample page two also remains available after OCR sampling fails.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 724.0,
+                    text: "The converter should not discard real digital text because OCR returned an error.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 688.0,
+                    text: "Warnings belong on stderr, but the output Typst should stay readable.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 652.0,
+                    text: "This regression keeps the sample page visibly nonblank for OCR fallback logic.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 616.0,
+                    text: "Strategy selection should degrade gracefully instead of aborting.",
+                },
+            ],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 760.0,
+                    text: "Native sample page three still decides the default strategy after warning-only OCR loss.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 724.0,
+                    text: "The first three pages should be sampled, warned, and then left alone.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 688.0,
+                    text: "No new CLI flags are needed for this graceful-degradation behavior.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 652.0,
+                    text: "A sparse rendered sample should not hide an unsupported OCR input warning.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 616.0,
+                    text: "The document should continue with native extraction once sampling is done.",
+                },
+            ],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 720.0,
+                text: "Later native page four should reuse the chosen strategy.",
+            }],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+    ];
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&pages, &[]));
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: OCR unavailable on page 1"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("sample OCR input is unsupported"),
+        "stderr:\n{stderr}"
+    );
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("Native sample page one keeps its text"));
+    assert!(main_typ.contains("Native sample page two also remains available"));
+    assert!(main_typ.contains("Native sample page three still decides the default"));
+    assert!(main_typ.contains("Later native page four should reuse the chosen strategy."));
+
+    let ocr_calls = read_to_string(&invocation_log).lines().count();
+    assert_eq!(ocr_calls, 3, "only the sampled pages should invoke OCR");
+}
+
+#[test]
 fn strict_mode_accepts_blank_sample_page_when_native_strategy_wins() {
     let output_root = test_path("strict-sampled-blank-page");
     let input = output_root.join("input.pdf");
@@ -2034,18 +2235,18 @@ fn strict_mode_uses_native_recovery_for_later_non_text_page_when_native_strategy
         },
         RichPageSpec {
             lines: &[],
-            extra_commands: &["q", "16 0 0 16 72 520 cm", "/Im1 Do", "Q"],
+            extra_commands: &["q", "360 0 0 360 72 280 cm", "/Im1 Do", "Q"],
             xobjects: &["Im1"],
         },
     ];
     let images = [ImageObjectSpec {
         name: "Im1",
-        width: 2,
-        height: 2,
+        width: 64,
+        height: 64,
         color_space: "DeviceGray",
         bits_per_component: 8,
         filter: ImageObjectFilter::Flate,
-        bytes: &[0, 255, 255, 0],
+        bytes: &[0; 4096],
     }];
 
     create_dir(&output_root);
@@ -2082,6 +2283,134 @@ fn strict_mode_uses_native_recovery_for_later_non_text_page_when_native_strategy
         ocr_calls, 3,
         "later non-text pages should not trigger OCR once the native default wins"
     );
+}
+
+#[test]
+fn strict_mode_continues_when_sampled_ocr_page_returns_no_text() {
+    let output_root = test_path("strict-sampled-native-recovery");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let (fake_tesseract, invocation_log) = install_optional_counting_ocr_stub(
+        &output_root,
+        &[
+            Some("ocr sample page one"),
+            None,
+            Some("ocr sample page three"),
+        ],
+    );
+    let pages = [
+        RichPageSpec {
+            lines: &[
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 760.0,
+                    text: "Substantive native sample page one should remain visible in strict mode.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 724.0,
+                    text: "This sample page stays clearly nonblank while OCR evaluation runs.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 688.0,
+                    text: "Native text should remain the fallback when OCR has incomplete data.",
+                },
+            ],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 760.0,
+                    text: "Sample page two keeps native text when OCR returns no text.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 724.0,
+                    text: "The warning should surface without turning strict mode into a hard failure.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 688.0,
+                    text: "Once sampling is done, the converter should continue with the chosen strategy.",
+                },
+            ],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+        RichPageSpec {
+            lines: &[
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 760.0,
+                    text: "Substantive native sample page three keeps the native choice stable.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 724.0,
+                    text: "This page confirms that the sample chooser does not abort the document.",
+                },
+                TextLine {
+                    font: "F1",
+                    size: 18.0,
+                    x: 72.0,
+                    y: 688.0,
+                    text: "The remaining pages should reuse the selected strategy after sampling.",
+                },
+            ],
+            extra_commands: &[],
+            xobjects: &[],
+        },
+    ];
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&pages, &[]));
+
+    let output = binary()
+        .env("PDF_TO_TYPST_TESSERACT_BIN", &fake_tesseract)
+        .arg(&input)
+        .arg(&output_dir)
+        .arg("--strict")
+        .output()
+        .expect("conversion should execute");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: OCR produced no text on page 2"),
+        "stderr:\n{stderr}"
+    );
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("Sample page two keeps native text when OCR returns no text."));
+
+    let ocr_calls = read_to_string(&invocation_log).lines().count();
+    assert_eq!(ocr_calls, 3, "only the sampled pages should invoke OCR");
 }
 
 #[test]
