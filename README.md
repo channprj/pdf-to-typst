@@ -12,7 +12,7 @@
 - OCR for scanned documents (Korean + English by default)
 - Table, image, and caption preservation
 - PDFKit-based text position recovery (macOS)
-- Ghostscript raster fallback for complex pages
+- Ghostscript-backed element image fallback for complex regions
 - `--strict` mode for CI/pipeline use (warnings become errors)
 
 ## Quick Start
@@ -70,7 +70,7 @@ cargo build --release
 
 ### Required
 
-- **Ghostscript** (`gs`) — raster fallback for complex PDF pages
+- **Ghostscript** (`gs`) — renders OCR inputs and element-level fallback crops for complex PDF regions
 
 ### Optional
 
@@ -149,7 +149,7 @@ output/
 
 3. **OCR fallback** — For scanned documents without embedded text, Tesseract performs optical character recognition with Korean and English language support by default.
 
-When native parsing cannot safely reconstruct complex pages, the converter falls back to per-page raster images so the generated Typst project stays previewable and exportable.
+When native parsing cannot safely reconstruct a complex table, diagram, or caption cluster, the converter falls back to cropped element images while leaving unrelated text on the same page as Typst text.
 
 ## Troubleshooting
 

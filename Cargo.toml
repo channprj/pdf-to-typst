@@ -11,3 +11,4 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 flate2 = "1.1.9"
+image = { version = "0.25.8", default-features = false, features = ["png"] }

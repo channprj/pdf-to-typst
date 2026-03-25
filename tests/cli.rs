@@ -60,26 +60,16 @@ fn compile_typst_project(input: &Path, output: &Path) {
     );
 }
 
-fn assert_rasterized_page_output(output_dir: &Path) {
+fn assert_no_whole_page_raster_output(output_dir: &Path) {
     let main_typ = read_to_string(&output_dir.join("main.typ"));
-    assert!(main_typ.contains("#set page(width: "));
-    assert!(main_typ.contains("#image(\"assets/page-0001.png\""));
-    assert!(output_dir.join("assets").join("page-0001.png").is_file());
-}
-
-fn assert_positioned_text_output(output_dir: &Path, expected_text: &str) {
-    let main_typ = read_to_string(&output_dir.join("main.typ"));
-    assert!(main_typ.contains("#place(left + top"));
-    assert!(main_typ.contains(expected_text));
     assert!(!main_typ.contains("#image(\"assets/page-0001.png\""));
+    assert!(!output_dir.join("assets").join("page-0001.png").exists());
 }
 
 fn assert_recovered_layout_output(output_dir: &Path, expected_text: &str) {
-    if cfg!(target_os = "macos") {
-        assert_positioned_text_output(output_dir, expected_text);
-    } else {
-        assert_rasterized_page_output(output_dir);
-    }
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains(expected_text));
+    assert!(!main_typ.contains("#image(\"assets/page-0001.png\""));
 }
 
 fn make_executable(path: &Path) {
@@ -1611,7 +1601,15 @@ fn scanned_pdf_reports_when_ocr_is_unavailable() {
 
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
-    assert_rasterized_page_output(&output_dir);
+    assert_no_whole_page_raster_output(&output_dir);
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("#image(\"assets/page-1-image-1.png\")"));
+    assert!(
+        output_dir
+            .join("assets")
+            .join("page-1-image-1.png")
+            .is_file()
+    );
 }
 
 #[test]
@@ -2504,7 +2502,7 @@ fn scanned_pdf_writes_ocr_input_to_tesseract_readable_path() {
 }
 
 #[test]
-fn scanned_pdf_keeps_successful_ocr_pages_when_later_page_needs_raster_fallback() {
+fn scanned_pdf_keeps_successful_ocr_pages_when_later_page_uses_native_image_fallback() {
     let output_root = test_path("ocr-partial-fallback");
     let input = output_root.join("input.pdf");
     let output_dir = output_root.join("out");
@@ -2543,9 +2541,15 @@ fn scanned_pdf_keeps_successful_ocr_pages_when_later_page_needs_raster_fallback(
     let main_typ = read_to_string(&output_dir.join("main.typ"));
     assert!(main_typ.contains("회의록 Meeting Notes"));
     assert!(main_typ.contains("English text joins same paragraph."));
-    assert!(main_typ.contains("#image(\"assets/page-0002.png\""));
+    assert!(main_typ.contains("#image(\"assets/page-2-image-1.png\""));
     assert!(!main_typ.contains("#image(\"assets/page-0001.png\""));
-    assert!(output_dir.join("assets").join("page-0002.png").is_file());
+    assert!(!main_typ.contains("#image(\"assets/page-0002.png\""));
+    assert!(
+        output_dir
+            .join("assets")
+            .join("page-2-image-1.png")
+            .is_file()
+    );
 }
 
 #[test]
@@ -2758,6 +2762,132 @@ fn rich_pdf_extracts_images_tables_and_captions_into_typst() {
     assert!(main_typ.contains("[Region]"));
     assert!(main_typ.contains("[APAC]"));
     assert!(main_typ.contains("[11]"));
+}
+
+#[test]
+fn complex_table_falls_back_to_element_image_without_flattening_page_text() {
+    let output_root = test_path("complex-table-element-fallback");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let page = RichPageSpec {
+        lines: &[
+            TextLine {
+                font: "F2",
+                size: 18.0,
+                x: 72.0,
+                y: 736.0,
+                text: "Quarterly Summary",
+            },
+            TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 706.0,
+                text: "Narrative text above the complex table should remain editable.",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 500.0,
+                text: "Table 2: Consolidated metrics",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 470.0,
+                text: "Region",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 220.0,
+                y: 470.0,
+                text: "Q1",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 340.0,
+                y: 470.0,
+                text: "Q2",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 452.0,
+                text: "APAC",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 220.0,
+                y: 452.0,
+                text: "12",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 340.0,
+                y: 452.0,
+                text: "18",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 434.0,
+                text: "Totals",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 220.0,
+                y: 434.0,
+                text: "30",
+            },
+            TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 360.0,
+                text: "Body text below the table should also remain editable.",
+            },
+        ],
+        extra_commands: &["72 425 320 62 re", "S"],
+        xobjects: &[],
+    };
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&[page], &[]));
+
+    let output = binary()
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_no_whole_page_raster_output(&output_dir);
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("Narrative text above the complex table should remain editable."));
+    assert!(main_typ.contains("Body text below the table should also remain editable."));
+    assert!(main_typ.contains("#image(\"assets/page-1-complex-1.png\""));
+    assert!(!main_typ.contains("kind: table"));
+    assert!(!main_typ.contains("[APAC]"));
+    assert!(
+        output_dir
+            .join("assets")
+            .join("page-1-complex-1.png")
+            .is_file()
+    );
 }
 
 #[test]

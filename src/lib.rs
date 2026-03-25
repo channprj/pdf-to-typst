@@ -1,10 +1,10 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
+use image::ImageFormat;
 
 const HELP_TEXT: &str = "\
 pdf-to-typst
@@ -33,7 +34,8 @@ Options:
 
 const DEFAULT_OCR_LANGUAGES: &str = "kor+eng";
 const DEFAULT_OCR_MIN_CONFIDENCE: f32 = 65.0;
-const RASTER_FALLBACK_DPI: u32 = 144;
+const ELEMENT_FALLBACK_DPI: u32 = 144;
+const ELEMENT_FALLBACK_PADDING_PT: f32 = 6.0;
 const PDFKIT_RENDER_SCALE: f32 = 2.0;
 const STRATEGY_SAMPLE_PAGES: usize = 3;
 
@@ -325,7 +327,6 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
 
     let mut pages = Vec::with_capacity(parsed_pages.len());
     let mut pdfkit_render_pages = HashSet::new();
-    let mut raster_fallback_pages = BTreeSet::new();
 
     for page in parsed_pages {
         let page_number = page.number;
@@ -335,21 +336,16 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
             document_strategy,
             sampled_ocr_attempts.get(&page_number).cloned(),
             &mut ocr_engine,
-        );
+        )?;
 
         match page_recovery_for_warnings(&converted.warnings) {
             Some(PageRecovery::Pdfkit) => {
                 pdfkit_render_pages.insert(page_number);
                 pages.push(PageAssembly {
                     number: page_number,
-                    fragment: None,
-                });
-            }
-            Some(PageRecovery::Raster) => {
-                raster_fallback_pages.insert(page_number);
-                pages.push(PageAssembly {
-                    number: page_number,
-                    fragment: None,
+                    fragment: converted.fragment,
+                    recovery: Some(PageRecovery::Pdfkit),
+                    warnings: converted.warnings,
                 });
             }
             None => {
@@ -357,6 +353,8 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
                 pages.push(PageAssembly {
                     number: page_number,
                     fragment: converted.fragment,
+                    recovery: None,
+                    warnings: Vec::new(),
                 });
             }
         }
@@ -365,7 +363,7 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
     if !pdfkit_render_pages.is_empty() {
         let recovered_pages = convert_pdf_pages_with_pdfkit(input_pdf, &pdfkit_render_pages)?;
         for page in &mut pages {
-            if page.fragment.is_some() || !pdfkit_render_pages.contains(&page.number) {
+            if page.recovery != Some(PageRecovery::Pdfkit) {
                 continue;
             }
 
@@ -376,24 +374,9 @@ fn convert_pdf(input_pdf: &Path) -> Result<ConvertedDocument, CliFailure> {
             {
                 page.fragment = Some(fragment);
             } else {
-                raster_fallback_pages.insert(page.number);
+                warnings.extend(dedupe_warnings(page.warnings.clone()));
             }
-        }
-    }
-
-    if !raster_fallback_pages.is_empty() {
-        let mut rasterized_pages = rasterize_pdf_pages(input_pdf, &raster_fallback_pages)?;
-        for page in &mut pages {
-            if page.fragment.is_some() || !raster_fallback_pages.contains(&page.number) {
-                continue;
-            }
-
-            page.fragment = Some(rasterized_pages.remove(&page.number).ok_or_else(|| {
-                CliFailure::fatal(format!(
-                    "error: failed to rasterize PDF page {} during fallback",
-                    page.number
-                ))
-            })?);
+            page.recovery = None;
         }
     }
 
@@ -454,6 +437,8 @@ struct PageFragment {
 struct PageAssembly {
     number: usize,
     fragment: Option<PageFragment>,
+    recovery: Option<PageRecovery>,
+    warnings: Vec<Warning>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -464,6 +449,8 @@ enum DocumentExtractionStrategy {
 
 struct ParsedPageData {
     number: usize,
+    width_pt: f32,
+    height_pt: f32,
     native_lines: Vec<ExtractedLine>,
     native_warnings: Vec<Warning>,
     xobjects: Vec<XObjectInvocation>,
@@ -473,12 +460,6 @@ struct ParsedPageData {
 struct PageConversion {
     warnings: Vec<Warning>,
     fragment: Option<PageFragment>,
-}
-
-struct RasterizedPage {
-    filename: String,
-    width_pt: f32,
-    height_pt: f32,
 }
 
 #[derive(Clone)]
@@ -516,7 +497,6 @@ impl OcrAttempt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PageRecovery {
     Pdfkit,
-    Raster,
 }
 
 struct PdfkitPage {
@@ -555,6 +535,11 @@ fn parse_page_data(
             "error: failed to parse PDF page {page_number}: {message}"
         ))
     })?;
+    let (width_pt, height_pt) = pdf.page_size(page_ref).map_err(|message| {
+        CliFailure::fatal(format!(
+            "error: failed to parse PDF page {page_number}: {message}"
+        ))
+    })?;
     let image_resources = pdf.page_image_resources(page_ref).map_err(|message| {
         CliFailure::fatal(format!(
             "error: failed to parse PDF page {page_number}: {message}"
@@ -588,6 +573,8 @@ fn parse_page_data(
 
     Ok(ParsedPageData {
         number: page_number,
+        width_pt,
+        height_pt,
         native_lines,
         native_warnings,
         xobjects,
@@ -648,7 +635,7 @@ fn convert_page_with_strategy(
     strategy: DocumentExtractionStrategy,
     sampled_ocr_attempt: Option<OcrAttempt>,
     ocr_engine: &mut OcrEngine,
-) -> PageConversion {
+) -> Result<PageConversion, CliFailure> {
     let has_native_recovery_path =
         !page.xobjects.is_empty() || page_recovery_for_warnings(&page.native_warnings).is_some();
     let should_try_ocr = strategy == DocumentExtractionStrategy::Ocr
@@ -664,12 +651,14 @@ fn convert_page_with_strategy(
             sampled_ocr_attempt,
             ocr_engine,
         );
-        if ocr_page.fragment.is_some() || page.native_lines.is_empty() {
-            return ocr_page;
+        if ocr_page.fragment.is_some()
+            || (page.native_lines.is_empty() && !has_native_recovery_path)
+        {
+            return Ok(ocr_page);
         }
     }
 
-    convert_page_with_native(page)
+    convert_page_with_native(input_pdf, page)
 }
 
 fn convert_page_with_ocr(
@@ -722,9 +711,14 @@ fn convert_page_with_ocr(
     PageConversion { warnings, fragment }
 }
 
-fn convert_page_with_native(page: ParsedPageData) -> PageConversion {
+fn convert_page_with_native(
+    input_pdf: &Path,
+    page: ParsedPageData,
+) -> Result<PageConversion, CliFailure> {
     let ParsedPageData {
         number,
+        width_pt,
+        height_pt,
         mut native_lines,
         mut native_warnings,
         xobjects,
@@ -732,8 +726,47 @@ fn convert_page_with_native(page: ParsedPageData) -> PageConversion {
     } = page;
 
     assign_line_ids(&mut native_lines);
-    let rendered = render_page(number, native_lines, xobjects, image_resources);
-    if rendered.has_structured_tables {
+    let mut rendered = render_page(number, native_lines, xobjects, image_resources);
+    if rendered.blocks.is_empty()
+        && rendered.pending_fallbacks.is_empty()
+        && native_warnings.iter().any(|warning| {
+            page_recovery_for_warning(warning.message()) == Some(PageRecovery::Pdfkit)
+        })
+    {
+        let mut pending_fallback_index = 0usize;
+        let pending = build_pending_element_fallback(
+            BoundingBox {
+                left: 0.0,
+                bottom: 0.0,
+                right: width_pt,
+                top: height_pt,
+            },
+            &mut pending_fallback_index,
+        );
+        rendered.blocks.push(pending.placeholder.clone());
+        rendered.pending_fallbacks.push(pending);
+    }
+    if !rendered.pending_fallbacks.is_empty() {
+        let resolved = rasterize_page_elements(
+            input_pdf,
+            number,
+            width_pt,
+            height_pt,
+            &rendered.pending_fallbacks,
+        )?;
+        for block in &mut rendered.blocks {
+            if let Some(replacement) = resolved.get(block) {
+                *block = replacement.block.clone();
+            }
+        }
+        rendered.assets.extend(
+            resolved
+                .into_values()
+                .map(|fallback| fallback.asset)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if rendered.has_structured_tables || !rendered.pending_fallbacks.is_empty() {
         native_warnings.retain(|warning| !is_vector_drawing_warning(warning.message()));
     }
     native_warnings.extend(rendered.warnings);
@@ -751,10 +784,10 @@ fn convert_page_with_native(page: ParsedPageData) -> PageConversion {
         })
     };
 
-    PageConversion {
+    Ok(PageConversion {
         warnings: native_warnings,
         fragment,
-    }
+    })
 }
 
 fn run_ocr_attempt(
@@ -785,8 +818,6 @@ fn page_recovery_for_warning(message: &str) -> Option<PageRecovery> {
         || message.contains("unsupported stream filter")
     {
         Some(PageRecovery::Pdfkit)
-    } else if message.contains("no digital text extracted") {
-        Some(PageRecovery::Raster)
     } else {
         None
     }
@@ -797,19 +828,10 @@ fn is_vector_drawing_warning(message: &str) -> bool {
 }
 
 fn page_recovery_for_warnings(warnings: &[Warning]) -> Option<PageRecovery> {
-    if warnings
+    warnings
         .iter()
         .any(|warning| page_recovery_for_warning(warning.message()) == Some(PageRecovery::Pdfkit))
-    {
-        Some(PageRecovery::Pdfkit)
-    } else if warnings
-        .iter()
-        .any(|warning| page_recovery_for_warning(warning.message()) == Some(PageRecovery::Raster))
-    {
-        Some(PageRecovery::Raster)
-    } else {
-        None
-    }
+        .then_some(PageRecovery::Pdfkit)
 }
 
 fn should_insert_page_break(
@@ -1185,96 +1207,6 @@ fn unescape_helper_field(field: &str) -> String {
     output
 }
 
-fn rasterize_pdf_pages(
-    input_pdf: &Path,
-    page_numbers: &BTreeSet<usize>,
-) -> Result<HashMap<usize, PageFragment>, CliFailure> {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temp_dir = env::temp_dir().join(format!(
-        "pdf-to-typst-page-render-{}-{timestamp}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&temp_dir).map_err(|error| {
-        CliFailure::fatal(format!(
-            "error: failed to prepare page raster fallback workspace {}: {error}",
-            temp_dir.display()
-        ))
-    })?;
-
-    let ghostscript = env::var_os("PDF_TO_TYPST_GS_BIN").unwrap_or_else(|| OsString::from("gs"));
-    let mut recovered_pages = HashMap::new();
-
-    for page_number in page_numbers {
-        let output_path = temp_dir.join(format!("page-{page_number:04}.png"));
-        let output = Command::new(&ghostscript)
-            .arg("-q")
-            .arg("-dSAFER")
-            .arg("-dBATCH")
-            .arg("-dNOPAUSE")
-            .arg("-sDEVICE=png16m")
-            .arg(format!("-r{RASTER_FALLBACK_DPI}"))
-            .arg(format!("-dFirstPage={page_number}"))
-            .arg(format!("-dLastPage={page_number}"))
-            .arg("-o")
-            .arg(&output_path)
-            .arg(input_pdf)
-            .output()
-            .map_err(|error| {
-                CliFailure::fatal(format!(
-                    "error: failed to launch Ghostscript raster fallback: {error}"
-                ))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let detail = stderr.trim();
-            let _ = fs::remove_dir_all(&temp_dir);
-            return Err(CliFailure::fatal(if detail.is_empty() {
-                format!("error: Ghostscript raster fallback failed for page {page_number}")
-            } else {
-                format!(
-                    "error: Ghostscript raster fallback failed for page {page_number}: {detail}"
-                )
-            }));
-        }
-
-        let bytes = fs::read(&output_path).map_err(|error| {
-            CliFailure::fatal(format!(
-                "error: failed to read rasterized page {}: {error}",
-                output_path.display()
-            ))
-        })?;
-        let (width_px, height_px) = parse_png_dimensions(&bytes).map_err(|message| {
-            CliFailure::fatal(format!(
-                "error: failed to inspect rasterized page {}: {message}",
-                output_path.display()
-            ))
-        })?;
-        let filename = format!("page-{page_number:04}.png");
-        let rasterized = RasterizedPage {
-            filename: filename.clone(),
-            width_pt: width_px as f32 * 72.0 / RASTER_FALLBACK_DPI as f32,
-            height_pt: height_px as f32 * 72.0 / RASTER_FALLBACK_DPI as f32,
-        };
-
-        recovered_pages.insert(
-            *page_number,
-            PageFragment {
-                blocks: render_raster_page_blocks(&rasterized),
-                assets: vec![OutputAsset { filename, bytes }],
-                layout: PageLayoutMode::Fixed,
-            },
-        );
-    }
-
-    let _ = fs::remove_dir_all(&temp_dir);
-
-    Ok(recovered_pages)
-}
-
 fn render_page_png_for_ocr(input_pdf: &Path, page_number: usize) -> Option<RenderedOcrPage> {
     let workspace = ocr_temp_workspace().ok()?;
     let path = workspace.join(format!(
@@ -1371,18 +1303,6 @@ fn parse_png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
     }
 
     Ok((width, height))
-}
-
-fn render_raster_page_blocks(page: &RasterizedPage) -> Vec<String> {
-    let width = format_pt(page.width_pt);
-    let height = format_pt(page.height_pt);
-    vec![
-        format!("#set page(width: {width}, height: {height}, margin: 0pt)"),
-        format!(
-            "#image(\"assets/{}\", width: {width}, height: {height})",
-            page.filename
-        ),
-    ]
 }
 
 fn format_pt(value: f32) -> String {
@@ -1573,6 +1493,38 @@ impl ParsedPdf {
 
         extract_reference_list_or_single(&object.dictionary, "/Contents")
             .ok_or_else(|| format!("page {object_id} is missing /Contents"))
+    }
+
+    fn page_size(&self, object_id: u32) -> Result<(f32, f32), String> {
+        let media_box = self
+            .page_media_box(object_id)?
+            .ok_or_else(|| format!("page {object_id} is missing /MediaBox"))?;
+        let width = (media_box[2] - media_box[0]).abs();
+        let height = (media_box[3] - media_box[1]).abs();
+        if width <= 0.0 || height <= 0.0 {
+            return Err(format!("page {object_id} has invalid /MediaBox"));
+        }
+        Ok((width, height))
+    }
+
+    fn page_media_box(&self, object_id: u32) -> Result<Option<[f32; 4]>, String> {
+        let object = self.object(object_id)?;
+        if let Some(media_box) = extract_number_array_value(&object.dictionary, "/MediaBox")
+            && media_box.len() == 4
+        {
+            return Ok(Some([
+                media_box[0],
+                media_box[1],
+                media_box[2],
+                media_box[3],
+            ]));
+        }
+
+        let parent = extract_reference_value(&object.dictionary, "/Parent");
+        match parent {
+            Some(parent_id) => self.page_media_box(parent_id),
+            None => Ok(None),
+        }
     }
 
     fn decode_content_stream(&self, object_id: u32) -> Result<Option<Vec<u8>>, String> {
@@ -2173,6 +2125,12 @@ fn extract_reference_list_or_single(dictionary: &str, key: &str) -> Option<Vec<u
     Some(vec![parse_reference(remainder)?.0])
 }
 
+fn extract_number_array_value(dictionary: &str, key: &str) -> Option<Vec<f32>> {
+    let remainder = dictionary.split_once(key)?.1.trim_start();
+    let array = extract_array(remainder)?;
+    parse_number_array(array)
+}
+
 fn extract_array(input: &str) -> Option<&str> {
     let mut depth = 0usize;
     let mut start = None;
@@ -2193,6 +2151,29 @@ fn extract_array(input: &str) -> Option<&str> {
     }
 
     None
+}
+
+fn parse_number_array(input: &str) -> Option<Vec<f32>> {
+    let mut values = Vec::new();
+    let mut token = String::new();
+
+    for ch in input.chars() {
+        if ch.is_ascii_whitespace() || matches!(ch, '[' | ']') {
+            if !token.is_empty() {
+                values.push(token.parse().ok()?);
+                token.clear();
+            }
+            continue;
+        }
+
+        token.push(ch);
+    }
+
+    if !token.is_empty() {
+        values.push(token.parse().ok()?);
+    }
+
+    Some(values)
 }
 
 fn extract_dictionary(input: &str) -> Option<&str> {
@@ -2390,10 +2371,31 @@ struct BoundingBox {
     top: f32,
 }
 
+impl BoundingBox {
+    fn union(self, other: BoundingBox) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            bottom: self.bottom.min(other.bottom),
+            right: self.right.max(other.right),
+            top: self.top.max(other.top),
+        }
+    }
+
+    fn expand(self, padding_pt: f32) -> Self {
+        Self {
+            left: self.left - padding_pt,
+            bottom: self.bottom - padding_pt,
+            right: self.right + padding_pt,
+            top: self.top + padding_pt,
+        }
+    }
+}
+
 struct XObjectInvocation {
     name: String,
     bounds: BoundingBox,
     sequence: usize,
+    is_rotated: bool,
 }
 
 fn concat_matrices(left: [f32; 6], right: [f32; 6]) -> [f32; 6] {
@@ -2571,6 +2573,8 @@ fn parse_content_stream(stream: &[u8], page_number: usize) -> Result<ParsedConte
                                 name: name.clone(),
                                 bounds: matrix_bounds(graphics_state.ctm),
                                 sequence: xobject_sequence,
+                                is_rotated: graphics_state.ctm[1].abs() > 0.01
+                                    || graphics_state.ctm[2].abs() > 0.01,
                             });
                             xobject_sequence += 1;
                         }
@@ -3475,6 +3479,7 @@ struct RenderedPage {
     warnings: Vec<Warning>,
     assets: Vec<OutputAsset>,
     has_structured_tables: bool,
+    pending_fallbacks: Vec<PendingElementFallback>,
 }
 
 struct PageRichElement {
@@ -3494,6 +3499,23 @@ struct CaptionCandidate {
     id: usize,
     text: String,
     y: f32,
+    bounds: BoundingBox,
+}
+
+struct PendingElementFallback {
+    placeholder: String,
+    bounds: BoundingBox,
+}
+
+struct ResolvedElementFallback {
+    block: String,
+    asset: OutputAsset,
+}
+
+struct RenderedPagePng {
+    bytes: Vec<u8>,
+    width_px: u32,
+    height_px: u32,
 }
 
 enum CaptionKind {
@@ -3518,8 +3540,9 @@ fn render_page(
     mut xobjects: Vec<XObjectInvocation>,
     image_resources: PageImageResources,
 ) -> RenderedPage {
-    let (mut rich_elements, mut consumed_ids) = detect_tables(&lines);
-    let has_structured_tables = !rich_elements.is_empty();
+    let mut pending_fallback_index = 0usize;
+    let (mut rich_elements, mut consumed_ids, mut pending_fallbacks, has_structured_tables) =
+        detect_tables(&lines, &mut pending_fallback_index);
     let mut warnings = Vec::new();
     let mut assets = Vec::new();
     let mut image_count = 0usize;
@@ -3547,7 +3570,32 @@ fn render_page(
             continue;
         };
 
+        let captions = collect_caption_candidates(
+            lines.as_slice(),
+            &consumed_ids,
+            invocation.bounds,
+            CaptionKind::Image,
+        );
+
         let Some(asset) = resource.asset.as_ref() else {
+            if resource.ocr_candidate.is_some() {
+                for caption in &captions {
+                    consumed_ids.insert(caption.id);
+                }
+                let fallback_bounds = bounds_with_captions(invocation.bounds, &captions);
+                let pending =
+                    build_pending_element_fallback(fallback_bounds, &mut pending_fallback_index);
+                rich_elements.push(PageRichElement {
+                    sort_y: captions.first().map_or(fallback_bounds.top, |caption| {
+                        caption.y.max(fallback_bounds.top)
+                    }),
+                    sort_x: fallback_bounds.left,
+                    block: pending.placeholder.clone(),
+                });
+                pending_fallbacks.push(pending);
+                continue;
+            }
+
             let detail = resource
                 .asset_issue
                 .as_deref()
@@ -3561,15 +3609,25 @@ fn render_page(
 
         image_count += 1;
         let filename = format!("page-{page_number}-image-{image_count}.{}", asset.extension);
-        let caption = find_caption_line(
-            lines.as_slice(),
-            &consumed_ids,
-            invocation.bounds,
-            CaptionKind::Image,
-        );
-        if let Some(caption) = &caption {
+        for caption in &captions {
             consumed_ids.insert(caption.id);
         }
+        if invocation.is_rotated || captions.len() > 1 {
+            let fallback_bounds = bounds_with_captions(invocation.bounds, &captions);
+            let pending =
+                build_pending_element_fallback(fallback_bounds, &mut pending_fallback_index);
+            rich_elements.push(PageRichElement {
+                sort_y: captions.first().map_or(fallback_bounds.top, |caption| {
+                    caption.y.max(fallback_bounds.top)
+                }),
+                sort_x: fallback_bounds.left,
+                block: pending.placeholder.clone(),
+            });
+            pending_fallbacks.push(pending);
+            continue;
+        }
+
+        let caption = captions.first();
 
         assets.push(OutputAsset {
             filename: filename.clone(),
@@ -3615,6 +3673,7 @@ fn render_page(
         warnings,
         assets,
         has_structured_tables,
+        pending_fallbacks,
     }
 }
 
@@ -3635,15 +3694,25 @@ fn page_event_sort_key(left: &PageEvent, right: &PageEvent) -> Ordering {
         .then_with(|| left_kind.cmp(&right_kind))
 }
 
-fn detect_tables(lines: &[ExtractedLine]) -> (Vec<PageRichElement>, HashSet<usize>) {
+fn detect_tables(
+    lines: &[ExtractedLine],
+    pending_fallback_index: &mut usize,
+) -> (
+    Vec<PageRichElement>,
+    HashSet<usize>,
+    Vec<PendingElementFallback>,
+    bool,
+) {
     if lines.is_empty() {
-        return (Vec::new(), HashSet::new());
+        return (Vec::new(), HashSet::new(), Vec::new(), false);
     }
 
     let rows = group_table_rows(lines);
     let body_font_size = infer_body_font_size(lines);
     let mut rich_elements = Vec::new();
     let mut consumed_ids = HashSet::new();
+    let mut pending_fallbacks = Vec::new();
+    let mut has_structured_tables = false;
     let mut row_index = 0usize;
 
     while let Some(row) = rows.get(row_index) {
@@ -3656,6 +3725,7 @@ fn detect_tables(lines: &[ExtractedLine]) -> (Vec<PageRichElement>, HashSet<usiz
         let mut matched_rows = vec![row.clone()];
         let mut previous_y = row.y;
         let mut next_index = row_index + 1;
+        let mut saw_complex_signal = false;
 
         while let Some(next_row) = rows.get(next_index) {
             let gap = previous_y - next_row.y;
@@ -3663,10 +3733,14 @@ fn detect_tables(lines: &[ExtractedLine]) -> (Vec<PageRichElement>, HashSet<usiz
                 break;
             }
 
+            if next_row.cells.len() < 2 || !row_has_distinct_columns(next_row, body_font_size) {
+                break;
+            }
+
             if next_row.cells.len() != column_positions.len()
                 || !columns_align(&column_positions, next_row, body_font_size)
             {
-                break;
+                saw_complex_signal = true;
             }
 
             matched_rows.push(next_row.clone());
@@ -3687,38 +3761,58 @@ fn detect_tables(lines: &[ExtractedLine]) -> (Vec<PageRichElement>, HashSet<usiz
             }
         }
 
-        let caption = find_caption_line(lines, &blocked, bounds, CaptionKind::Table);
+        let captions = collect_caption_candidates(lines, &blocked, bounds, CaptionKind::Table);
         let mut table_consumed = blocked
             .difference(&consumed_ids)
             .copied()
             .collect::<HashSet<_>>();
-        if let Some(caption) = &caption {
+        for caption in &captions {
             table_consumed.insert(caption.id);
         }
 
-        rich_elements.push(PageRichElement {
-            sort_y: caption
-                .as_ref()
-                .map_or(bounds.top, |caption| caption.y.max(bounds.top)),
-            sort_x: bounds.left,
-            block: render_table_block(
-                &matched_rows
-                    .iter()
-                    .map(|row| {
-                        row.cells
-                            .iter()
-                            .map(|cell| normalize_plain_line(&cell.text))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>(),
-                caption.as_ref().map(|caption| caption.text.as_str()),
-            ),
-        });
+        if saw_complex_signal || captions.len() > 1 {
+            let fallback_bounds = bounds_with_captions(bounds, &captions);
+            let pending = build_pending_element_fallback(fallback_bounds, pending_fallback_index);
+            rich_elements.push(PageRichElement {
+                sort_y: captions.first().map_or(fallback_bounds.top, |caption| {
+                    caption.y.max(fallback_bounds.top)
+                }),
+                sort_x: fallback_bounds.left,
+                block: pending.placeholder.clone(),
+            });
+            pending_fallbacks.push(pending);
+        } else {
+            let caption = captions.first();
+            rich_elements.push(PageRichElement {
+                sort_y: caption
+                    .as_ref()
+                    .map_or(bounds.top, |caption| caption.y.max(bounds.top)),
+                sort_x: bounds.left,
+                block: render_table_block(
+                    &matched_rows
+                        .iter()
+                        .map(|row| {
+                            row.cells
+                                .iter()
+                                .map(|cell| normalize_plain_line(&cell.text))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>(),
+                    caption.map(|caption| caption.text.as_str()),
+                ),
+            });
+            has_structured_tables = true;
+        }
         consumed_ids.extend(table_consumed);
         row_index = next_index;
     }
 
-    (rich_elements, consumed_ids)
+    (
+        rich_elements,
+        consumed_ids,
+        pending_fallbacks,
+        has_structured_tables,
+    )
 }
 
 fn group_table_rows(lines: &[ExtractedLine]) -> Vec<TableRowGroup> {
@@ -3803,13 +3897,13 @@ fn table_bounds(rows: &[TableRowGroup], body_font_size: f32) -> BoundingBox {
     }
 }
 
-fn find_caption_line(
+fn collect_caption_candidates(
     lines: &[ExtractedLine],
     blocked_ids: &HashSet<usize>,
     bounds: BoundingBox,
     kind: CaptionKind,
-) -> Option<CaptionCandidate> {
-    lines
+) -> Vec<CaptionCandidate> {
+    let mut candidates = lines
         .iter()
         .filter(|line| !blocked_ids.contains(&line.id))
         .filter_map(|line| {
@@ -3835,16 +3929,237 @@ fn find_caption_line(
             }
 
             let rank = if line.y >= bounds.top { 0usize } else { 1usize };
-            Some((vertical_distance, rank, line.id, line.y, text))
+            Some((
+                vertical_distance,
+                rank,
+                line.id,
+                line.y,
+                line.sequence,
+                CaptionCandidate {
+                    id: line.id,
+                    text,
+                    y: line.y,
+                    bounds: approximate_line_bounds(line),
+                },
+            ))
         })
-        .min_by(|left, right| {
-            left.0
-                .partial_cmp(&right.0)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| right.3.partial_cmp(&left.3).unwrap_or(Ordering::Equal))
-        })
-        .map(|(_, _, id, y, text)| CaptionCandidate { id, text, y })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        left.0
+            .partial_cmp(&right.0)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| right.3.partial_cmp(&left.3).unwrap_or(Ordering::Equal))
+            .then_with(|| left.4.cmp(&right.4))
+    });
+
+    candidates
+        .into_iter()
+        .map(|(_, _, _, _, _, candidate)| candidate)
+        .collect()
+}
+
+fn approximate_line_bounds(line: &ExtractedLine) -> BoundingBox {
+    let text = normalize_plain_line(&line.text);
+    let width = approximate_text_width(&text, line.font_size).max(line.font_size);
+    BoundingBox {
+        left: line.x,
+        bottom: line.y - line.font_size * 0.4,
+        right: line.x + width,
+        top: line.y + line.font_size,
+    }
+}
+
+fn approximate_text_width(text: &str, font_size: f32) -> f32 {
+    let glyph_count = text.chars().count().max(1) as f32;
+    glyph_count * font_size * 0.6
+}
+
+fn bounds_with_captions(bounds: BoundingBox, captions: &[CaptionCandidate]) -> BoundingBox {
+    captions
+        .iter()
+        .fold(bounds, |current, caption| current.union(caption.bounds))
+}
+
+fn build_pending_element_fallback(
+    bounds: BoundingBox,
+    pending_fallback_index: &mut usize,
+) -> PendingElementFallback {
+    *pending_fallback_index += 1;
+    PendingElementFallback {
+        placeholder: format!(
+            "__PDF_TO_TYTPST_ELEMENT_FALLBACK_{}__",
+            pending_fallback_index
+        ),
+        bounds: bounds.expand(ELEMENT_FALLBACK_PADDING_PT),
+    }
+}
+
+fn render_element_fallback_block(filename: &str, width_pt: f32, height_pt: f32) -> String {
+    format!(
+        "#image(\"assets/{filename}\", width: {}, height: {})",
+        format_pt(width_pt),
+        format_pt(height_pt)
+    )
+}
+
+fn rasterize_page_elements(
+    input_pdf: &Path,
+    page_number: usize,
+    page_width_pt: f32,
+    page_height_pt: f32,
+    pending_fallbacks: &[PendingElementFallback],
+) -> Result<HashMap<String, ResolvedElementFallback>, CliFailure> {
+    let rendered_page = render_pdf_page_png(input_pdf, page_number)?;
+    let image = image::load_from_memory_with_format(&rendered_page.bytes, ImageFormat::Png)
+        .map_err(|error| {
+            CliFailure::fatal(format!(
+                "error: failed to decode rendered page {page_number} for element fallback: {error}"
+            ))
+        })?;
+    let mut resolved = HashMap::new();
+
+    for (index, pending) in pending_fallbacks.iter().enumerate() {
+        let (left, top, width, height) = crop_rect_for_bounds(
+            pending.bounds,
+            page_width_pt,
+            page_height_pt,
+            rendered_page.width_px,
+            rendered_page.height_px,
+        )
+        .ok_or_else(|| {
+            CliFailure::fatal(format!(
+                "error: failed to crop complex element fallback on page {page_number}"
+            ))
+        })?;
+
+        let cropped = image.crop_imm(left, top, width, height);
+        let filename = format!("page-{page_number}-complex-{}.png", index + 1);
+        let mut bytes = Cursor::new(Vec::new());
+        cropped.write_to(&mut bytes, ImageFormat::Png).map_err(|error| {
+            CliFailure::fatal(format!(
+                "error: failed to encode complex element fallback on page {page_number}: {error}"
+            ))
+        })?;
+
+        let width_pt = width as f32 * 72.0 / ELEMENT_FALLBACK_DPI as f32;
+        let height_pt = height as f32 * 72.0 / ELEMENT_FALLBACK_DPI as f32;
+        resolved.insert(
+            pending.placeholder.clone(),
+            ResolvedElementFallback {
+                block: render_element_fallback_block(&filename, width_pt, height_pt),
+                asset: OutputAsset {
+                    filename,
+                    bytes: bytes.into_inner(),
+                },
+            },
+        );
+    }
+
+    Ok(resolved)
+}
+
+fn crop_rect_for_bounds(
+    bounds: BoundingBox,
+    page_width_pt: f32,
+    page_height_pt: f32,
+    image_width_px: u32,
+    image_height_px: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if !(page_width_pt.is_finite() && page_height_pt.is_finite())
+        || page_width_pt <= 0.0
+        || page_height_pt <= 0.0
+    {
+        return None;
+    }
+
+    let scale_x = image_width_px as f32 / page_width_pt;
+    let scale_y = image_height_px as f32 / page_height_pt;
+    let left = (bounds.left.max(0.0) * scale_x).floor().max(0.0) as u32;
+    let right = (bounds.right.min(page_width_pt) * scale_x)
+        .ceil()
+        .min(image_width_px as f32) as u32;
+    let top = ((page_height_pt - bounds.top.min(page_height_pt)) * scale_y)
+        .floor()
+        .max(0.0) as u32;
+    let bottom = ((page_height_pt - bounds.bottom.max(0.0)) * scale_y)
+        .ceil()
+        .min(image_height_px as f32) as u32;
+
+    (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
+}
+
+fn render_pdf_page_png(
+    input_pdf: &Path,
+    page_number: usize,
+) -> Result<RenderedPagePng, CliFailure> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_dir = env::temp_dir().join(format!(
+        "pdf-to-typst-element-render-{}-{timestamp}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&temp_dir).map_err(|error| {
+        CliFailure::fatal(format!(
+            "error: failed to prepare element fallback workspace {}: {error}",
+            temp_dir.display()
+        ))
+    })?;
+
+    let output_path = temp_dir.join(format!("page-{page_number:04}.png"));
+    let ghostscript = env::var_os("PDF_TO_TYPST_GS_BIN").unwrap_or_else(|| OsString::from("gs"));
+    let output = Command::new(&ghostscript)
+        .arg("-q")
+        .arg("-dSAFER")
+        .arg("-dBATCH")
+        .arg("-dNOPAUSE")
+        .arg("-sDEVICE=png16m")
+        .arg(format!("-r{ELEMENT_FALLBACK_DPI}"))
+        .arg(format!("-dFirstPage={page_number}"))
+        .arg(format!("-dLastPage={page_number}"))
+        .arg("-o")
+        .arg(&output_path)
+        .arg(input_pdf)
+        .output()
+        .map_err(|error| {
+            CliFailure::fatal(format!(
+                "error: failed to launch Ghostscript element fallback render: {error}"
+            ))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(CliFailure::fatal(if detail.is_empty() {
+            format!("error: Ghostscript element fallback failed for page {page_number}")
+        } else {
+            format!("error: Ghostscript element fallback failed for page {page_number}: {detail}")
+        }));
+    }
+
+    let bytes = fs::read(&output_path).map_err(|error| {
+        CliFailure::fatal(format!(
+            "error: failed to read rendered page {}: {error}",
+            output_path.display()
+        ))
+    })?;
+    let (width_px, height_px) = parse_png_dimensions(&bytes).map_err(|message| {
+        CliFailure::fatal(format!(
+            "error: failed to inspect rendered page {}: {message}",
+            output_path.display()
+        ))
+    })?;
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    Ok(RenderedPagePng {
+        bytes,
+        width_px,
+        height_px,
+    })
 }
 
 fn matches_caption(text: &str, kind: &CaptionKind) -> bool {
@@ -4240,7 +4555,7 @@ mod tests {
     }
 
     #[test]
-    fn warning_classification_distinguishes_pdfkit_and_raster_recovery() {
+    fn warning_classification_only_uses_pdfkit_recovery() {
         assert_eq!(
             page_recovery_for_warning("unsupported content on page 1: vector drawing commands"),
             Some(PageRecovery::Pdfkit)
@@ -4255,7 +4570,7 @@ mod tests {
         );
         assert_eq!(
             page_recovery_for_warning("unsupported content on page 1: no digital text extracted"),
-            Some(PageRecovery::Raster)
+            None
         );
     }
 
@@ -4417,6 +4732,7 @@ mod tests {
             None,
             &mut ocr_engine,
         )
+        .expect("page 1 conversion should succeed")
         .fragment
         .expect("page 1 should render with OCR")
         .blocks
@@ -4428,6 +4744,7 @@ mod tests {
             None,
             &mut ocr_engine,
         )
+        .expect("page 3 conversion should succeed")
         .fragment
         .expect("page 3 should render with OCR")
         .blocks
