@@ -36,6 +36,29 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## Versioning
+
+`VERSION` is the release source of truth. When you need to change the release
+version, write it in this exact format:
+
+```text
+vYYYY.MMDD.N
+```
+
+- Keep the leading `v`.
+- `YYYY` is the 4-digit year.
+- `MMDD` is the zero-padded month and day.
+- `N` is the build number for that KST (`Asia/Seoul`) date.
+- The first build for a new KST date must use `N = 1`.
+- If you create another build on the same KST date, increment `N` by 1.
+- If the KST date changes, replace the date portion and reset `N` to `1`.
+
+Examples:
+
+- First build on March 23, 2026: `v2026.0323.1`
+- Next build on March 23, 2026: `v2026.0323.2`
+- First build on March 24, 2026: `v2026.0324.1`
+
 <!-- BEGIN BEADS INTEGRATION -->
 ## Issue Tracking with bd (beads)
 
