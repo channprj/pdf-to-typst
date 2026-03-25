@@ -15,7 +15,7 @@ class HomebrewFormulaGenerationTest(unittest.TestCase):
                 "python3",
                 str(SCRIPT),
                 "--version-tag",
-                "v0.260323.1",
+                "v2026.0325.1",
                 "--sha256",
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "--out-dir",
@@ -35,10 +35,10 @@ class HomebrewFormulaGenerationTest(unittest.TestCase):
 
         self.assertIn("class PdfToTypst < Formula", formula)
         self.assertIn(
-            'url "https://github.com/channprj/pdf-to-typst/archive/refs/tags/v0.260323.1.tar.gz"',
+            'url "https://github.com/channprj/pdf-to-typst/archive/refs/tags/v2026.0325.1.tar.gz"',
             formula,
         )
-        self.assertIn('version "0.260323.1"', formula)
+        self.assertIn('version "2026.0325.1"', formula)
         self.assertIn('(lib/"pdf-to-typst").install "tools"', formula)
 
     def test_generates_versioned_formula_for_exact_release(self) -> None:
@@ -47,16 +47,16 @@ class HomebrewFormulaGenerationTest(unittest.TestCase):
 
             self.run_generator(out_dir)
 
-            formula = (out_dir / "pdf-to-typst@0.260323.1.rb").read_text()
+            formula = (out_dir / "pdf-to-typst@2026.0325.1.rb").read_text()
 
-        self.assertIn("class PdfToTypstAT02603231 < Formula", formula)
+        self.assertIn("class PdfToTypstAT202603251 < Formula", formula)
         self.assertIn(
-            'url "https://github.com/channprj/pdf-to-typst/archive/refs/tags/v0.260323.1.tar.gz"',
+            'url "https://github.com/channprj/pdf-to-typst/archive/refs/tags/v2026.0325.1.tar.gz"',
             formula,
         )
-        self.assertIn('version "0.260323.1"', formula)
+        self.assertIn('version "2026.0325.1"', formula)
         self.assertIn(
-            'assert_match "v0.260323.1", shell_output("#{bin}/pdf-to-typst --version")',
+            'assert_match "v2026.0325.1", shell_output("#{bin}/pdf-to-typst --version")',
             formula,
         )
 

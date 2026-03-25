@@ -49,8 +49,8 @@ jobs:
             exit 1
           fi
 
-          if [[ ! "${VERSION_TAG}" =~ ^v[0-9]+\.[0-9]{6}\.[0-9]+$ ]]; then
-            echo "error: VERSION must match v{major}.{YYMMDD}.{ID}; got ${VERSION_TAG}" >&2
+          if [[ ! "${VERSION_TAG}" =~ ^v[0-9]{4}\.[0-9]{4}\.[0-9]+$ ]]; then
+            echo "error: VERSION must match v{YYYY}.{MMDD}.{N}; got ${VERSION_TAG}" >&2
             exit 1
           fi
 

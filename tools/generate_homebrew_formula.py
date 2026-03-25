@@ -6,7 +6,7 @@ import re
 import textwrap
 
 
-VERSION_TAG_PATTERN = re.compile(r"^v(?P<version>\d+\.\d{6}\.\d+)$")
+VERSION_TAG_PATTERN = re.compile(r"^v(?P<version>\d{4}\.\d{4}\.\d+)$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,7 +24,7 @@ def parse_version(version_tag: str) -> str:
     match = VERSION_TAG_PATTERN.fullmatch(version_tag)
     if match is None:
         raise ValueError(
-            f"VERSION tag must match v{{major}}.{{YYMMDD}}.{{ID}}; got {version_tag}"
+            f"VERSION tag must match v{{YYYY}}.{{MMDD}}.{{N}}; got {version_tag}"
         )
     return match.group("version")
 
