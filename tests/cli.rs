@@ -2761,6 +2761,158 @@ fn rich_pdf_extracts_images_tables_and_captions_into_typst() {
 }
 
 #[test]
+fn strict_mode_keeps_simple_rich_content_structured_when_vector_rules_are_present() {
+    let output_root = test_path("rich-elements-vector-rules");
+    let input = output_root.join("input.pdf");
+    let output_dir = output_root.join("out");
+    let page = RichPageSpec {
+        lines: &[
+            TextLine {
+                font: "F2",
+                size: 18.0,
+                x: 72.0,
+                y: 736.0,
+                text: "Quarterly Summary",
+            },
+            TextLine {
+                font: "F1",
+                size: 12.0,
+                x: 72.0,
+                y: 706.0,
+                text: "Rich content should survive the conversion.",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 500.0,
+                text: "Figure 1: Revenue heatmap",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 440.0,
+                text: "Table 1: Regional metrics",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 410.0,
+                text: "Region",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 220.0,
+                y: 410.0,
+                text: "Q1",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 340.0,
+                y: 410.0,
+                text: "Q2",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 392.0,
+                text: "APAC",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 220.0,
+                y: 392.0,
+                text: "12",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 340.0,
+                y: 392.0,
+                text: "18",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 72.0,
+                y: 374.0,
+                text: "EMEA",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 220.0,
+                y: 374.0,
+                text: "9",
+            },
+            TextLine {
+                font: "F1",
+                size: 11.0,
+                x: 340.0,
+                y: 374.0,
+                text: "11",
+            },
+        ],
+        extra_commands: &[
+            "q",
+            "192 0 0 108 72 548 cm",
+            "/Im1 Do",
+            "Q",
+            "72 548 192 108 re",
+            "S",
+            "72 366 320 62 re",
+            "S",
+        ],
+        xobjects: &["Im1"],
+    };
+    let image = ImageObjectSpec {
+        name: "Im1",
+        width: 2,
+        height: 2,
+        color_space: "DeviceRGB",
+        bits_per_component: 8,
+        filter: ImageObjectFilter::Flate,
+        bytes: &[
+            255, 0, 0, 0, 255, 0, //
+            0, 0, 255, 255, 255, 0,
+        ],
+    };
+
+    create_dir(&output_root);
+    write_file(&input, &build_rich_pdf(&[page], &[image]));
+
+    let output = binary()
+        .arg("--strict")
+        .arg(&input)
+        .arg(&output_dir)
+        .output()
+        .expect("conversion should execute");
+
+    assert!(
+        output.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let main_typ = read_to_string(&output_dir.join("main.typ"));
+    assert!(main_typ.contains("Rich content should survive the conversion."));
+    assert!(main_typ.contains("#figure("));
+    assert!(main_typ.contains("image(\"assets/page-1-image-1.png\")"));
+    assert!(main_typ.contains("caption: [Figure 1: Revenue heatmap]"));
+    assert!(main_typ.contains("kind: table"));
+    assert!(main_typ.contains("caption: [Table 1: Regional metrics]"));
+    assert!(!main_typ.contains("#set page(width: "));
+    assert!(!main_typ.contains("#place(left + top"));
+    assert!(!main_typ.contains("#image(\"assets/page-0001.png\""));
+}
+
+#[test]
 fn degraded_rich_elements_are_recorded_when_images_cannot_be_extracted() {
     let output_root = test_path("rich-degraded");
     let input = output_root.join("input.pdf");

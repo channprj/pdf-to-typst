@@ -733,6 +733,9 @@ fn convert_page_with_native(page: ParsedPageData) -> PageConversion {
 
     assign_line_ids(&mut native_lines);
     let rendered = render_page(number, native_lines, xobjects, image_resources);
+    if rendered.has_structured_tables {
+        native_warnings.retain(|warning| !is_vector_drawing_warning(warning.message()));
+    }
     native_warnings.extend(rendered.warnings);
 
     let fragment = if rendered.blocks.is_empty() {
@@ -776,7 +779,7 @@ fn run_ocr_attempt(
 }
 
 fn page_recovery_for_warning(message: &str) -> Option<PageRecovery> {
-    if message.contains("vector drawing commands")
+    if is_vector_drawing_warning(message)
         || message.contains("XObject invocation")
         || message.contains("inline image data")
         || message.contains("unsupported stream filter")
@@ -787,6 +790,10 @@ fn page_recovery_for_warning(message: &str) -> Option<PageRecovery> {
     } else {
         None
     }
+}
+
+fn is_vector_drawing_warning(message: &str) -> bool {
+    message.contains("vector drawing commands")
 }
 
 fn page_recovery_for_warnings(warnings: &[Warning]) -> Option<PageRecovery> {
@@ -3467,6 +3474,7 @@ struct RenderedPage {
     blocks: Vec<String>,
     warnings: Vec<Warning>,
     assets: Vec<OutputAsset>,
+    has_structured_tables: bool,
 }
 
 struct PageRichElement {
@@ -3511,6 +3519,7 @@ fn render_page(
     image_resources: PageImageResources,
 ) -> RenderedPage {
     let (mut rich_elements, mut consumed_ids) = detect_tables(&lines);
+    let has_structured_tables = !rich_elements.is_empty();
     let mut warnings = Vec::new();
     let mut assets = Vec::new();
     let mut image_count = 0usize;
@@ -3605,6 +3614,7 @@ fn render_page(
         blocks,
         warnings,
         assets,
+        has_structured_tables,
     }
 }
 
